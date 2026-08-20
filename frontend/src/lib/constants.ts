@@ -64,6 +64,11 @@ export const MODULE_OPTIONS: ModuleOption[] = [
     description: "Room/bed layout, admitting and discharging patients.",
   },
   {
+    value: "er",
+    label: "Emergency Room",
+    description: "ER registration, triage, treatment, and disposition workflows.",
+  },
+  {
     value: "pharmacy",
     label: "Pharmacy",
     description: "Inventory and pharmacy sales operations.",
@@ -129,6 +134,18 @@ export const SUB_MODULES: Partial<Record<ModuleId, SubModuleOption[]>> = {
       label: "Add/Edit Beds & Admit/Discharge Patients",
     },
   ],
+  // Deliberately no "bed_request" sub-item: fulfilling an ER bed request is a
+  // Bed Management action (calls the same assign-bed function unchanged) and
+  // is gated on beds.write instead, so ER clinical staff and Reception/bed
+  // staff stay separate grants -- see modules/er/routes.py.
+  er: [
+    { value: "registration", label: "ER Registration & Intake" },
+    { value: "triage", label: "Triage & Vitals" },
+    { value: "treatment", label: "Emergency Treatment" },
+    { value: "doctor_assignment", label: "Doctor Assignment & Clinical Notes" },
+    { value: "disposition", label: "Disposition Decision" },
+    { value: "config", label: "Triage Category Configuration" },
+  ],
   pharmacy: [
     { value: "inventory", label: "Inventory" },
     { value: "sales", label: "Sales" },
@@ -179,6 +196,13 @@ export const ADMIN_PERMISSIONS: string[] = [
   "op.doctors.write",
   "beds.read",
   "beds.write",
+  "er.read",
+  "er.registration.write",
+  "er.triage.write",
+  "er.treatment.write",
+  "er.doctor_assignment.write",
+  "er.disposition.write",
+  "er.config.write",
   "symptom_ai.use",
   "symptom_ai.documents.write",
   "employees.read",
@@ -228,6 +252,15 @@ export const MODULE_PERMISSIONS: Record<ModuleId, string[]> = {
   ],
   op: ["op.read", "op.schedules.write", "op.doctors.write"],
   beds: ["beds.read", "beds.write"],
+  er: [
+    "er.read",
+    "er.registration.write",
+    "er.triage.write",
+    "er.treatment.write",
+    "er.doctor_assignment.write",
+    "er.disposition.write",
+    "er.config.write",
+  ],
   billing: ["billing.read", "billing.invoices.write", "billing.claims.write"],
   pharmacy: [
     "pharmacy.read",
@@ -281,6 +314,14 @@ export const SUB_MODULE_PERMISSIONS: Partial<
   },
   beds: {
     manage: ["beds.write"],
+  },
+  er: {
+    registration: ["er.registration.write"],
+    triage: ["er.triage.write"],
+    treatment: ["er.treatment.write"],
+    doctor_assignment: ["er.doctor_assignment.write"],
+    disposition: ["er.disposition.write"],
+    config: ["er.config.write"],
   },
   billing: {
     invoices: ["billing.invoices.write"],
@@ -437,6 +478,15 @@ export const NAV_ITEMS: NavItem[] = [
     permission: "beds.read",
     deniedHint: "Requires bed management access.",
     module: "beds",
+  },
+  {
+    id: "er",
+    label: "Emergency Room",
+    subtitle: "Register, triage, and treat ER patients through to disposition.",
+    group: "operations",
+    permission: "er.read",
+    deniedHint: "Requires Emergency Room access.",
+    module: "er",
   },
   {
     id: "pharmacy",
