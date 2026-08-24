@@ -1,9 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Dispatch, FormEvent, KeyboardEvent, SetStateAction } from "react";
 import {
   Alert,
   Button,
-  Checkbox,
   Input,
   Label,
   Select,
@@ -11,7 +10,8 @@ import {
 } from "../components/ui";
 import { EMPTY_PATIENT_FORM } from "../lib/constants";
 import { apiFetch, reportError } from "../lib/api";
-import type { Notice, PatientForm } from "../types";
+import type { Notice, PatientForm, PatientMatchItem } from "../types";
+import { FiCheckCircle, FiAlertCircle, FiUserCheck, FiArrowRight, FiUserPlus } from "react-icons/fi";
 
 type Props = {
   onCreate: (
@@ -22,21 +22,6 @@ type Props = {
   ) => Promise<{ patient_id: string; admission_id?: string } | null>;
   setNotice: Dispatch<SetStateAction<Notice | null>>;
   onNavigate: (page: string, extraData?: any) => void;
-  // Set when registration was reached via ER's "New" patient mode -- see
-  // App.tsx's navigateToPage. When present, a successful registration
-  // returns to that module (with the new patient handed back) instead of
-  // always defaulting to appointment booking.
-  returnTo?: string | null;
-  // Set when reached via an unknown ER visit's "Register as New Patient"
-  // button (returnTo "er-merge"). The newly created patient gets merged
-  // into this specific visit on return -- see App.tsx's navigateToPage and
-  // ErPage's mergeTarget handling.
-  mergeVisitId?: number | null;
-};
-
-type Department = {
-  id: number;
-  department_name?: string;
 };
 
 function calculateAgeFromDob(dob: string): string {
@@ -75,6 +60,11 @@ export default function AddPatientPage({
   // and two patient records get created.
   const [submitting, setSubmitting] = useState(false);
 
+  // Live match state
+  const [matchingPatients, setMatchingPatients] = useState<PatientMatchItem[]>([]);
+  const [checkingMatch, setCheckingMatch] = useState(false);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const refreshPatientId = async () => {
     try {
       const data = await apiFetch<{ patient_id?: string }>(
@@ -109,9 +99,42 @@ export default function AddPatientPage({
           : prev.symptoms,
       }));
     } catch {
-      // malformed sessionStorage payload — ignore and leave the form blank
+      // malformed sessionStorage payload — ignore
     }
   }, []);
+
+  // Debounced search for New vs Existing Patient
+  useEffect(() => {
+    const query = `${form.name} ${form.last_name || ""} ${form.phone || ""}`.trim();
+    if (searchTimerRef.current) {
+      clearTimeout(searchTimerRef.current);
+    }
+    if (query.length < 2) {
+      setMatchingPatients([]);
+      setCheckingMatch(false);
+      return;
+    }
+
+    setCheckingMatch(true);
+    searchTimerRef.current = setTimeout(async () => {
+      try {
+        const res = await apiFetch<{ matches: PatientMatchItem[]; is_match: boolean }>(
+          `/api/op/patients/check-match?q=${encodeURIComponent(query)}`
+        );
+        setMatchingPatients(res.matches || []);
+      } catch {
+        setMatchingPatients([]);
+      } finally {
+        setCheckingMatch(false);
+      }
+    }, 300);
+
+    return () => {
+      if (searchTimerRef.current) {
+        clearTimeout(searchTimerRef.current);
+      }
+    };
+  }, [form.name, form.last_name, form.phone]);
 
   const handleFormKeyDown = (event: KeyboardEvent<HTMLFormElement>) => {
     const tagName = (event.target as HTMLElement).tagName;
@@ -199,7 +222,7 @@ export default function AddPatientPage({
 
     setNotice({
       type: "success",
-      message: `Patient ${createdPatient.patient_id} registered. Redirecting to appointment booking...`,
+      message: `Patient ${createdPatient.patient_id} registered. Redirecting to OP appointment booking...`,
     });
 
     onNavigate("appointment-in");
@@ -243,21 +266,122 @@ export default function AddPatientPage({
   const handleClearForm = () => {
     setForm(EMPTY_PATIENT_FORM);
     setDuplicateInfo(null);
+    setMatchingPatients([]);
     void refreshPatientId();
   };
 
+  const handleSelectExisting = (patient: PatientMatchItem) => {
+    setNotice({
+      type: "success",
+      message: `Selected existing patient ${patient.full_name} (${patient.patient_id}). Opening OP appointment booking...`,
+    });
+    onNavigate("appointment-in", {
+      patient_id: patient.patient_id,
+      patient_name: patient.full_name,
+    });
+  };
+
+  const hasEnteredDetails = form.name.trim().length > 1;
+
   return (
-    <section className="form-layout">
-      <div className="panel">
-        <p className="muted">
-          Patient ID: {patientId || "Will be generated on save"}
-        </p>
+    <section className="form-layout" style={{ maxWidth: "1100px", margin: "0 auto" }}>
+      <div className="panel" style={{ background: "#ffffff", borderRadius: "12px", border: "1px solid #e2e8f0", padding: "1.5rem" }}>
+        
+        {/* Real-time New vs Existing Patient Status Banner */}
+        <div style={{ marginBottom: "1.25rem" }}>
+          {hasEnteredDetails && matchingPatients.length > 0 ? (
+            <div style={{
+              background: "#ecfdf5",
+              border: "1px solid #6ee7b7",
+              borderRadius: "10px",
+              padding: "1rem",
+              marginBottom: "1rem"
+            }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.5rem" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", color: "#065f46", fontWeight: 700 }}>
+                  <FiUserCheck style={{ fontSize: "1.2rem", color: "#059669" }} />
+                  <span>Existing Patient Match Found ({matchingPatients.length} matching)</span>
+                </div>
+                <span style={{ fontSize: "0.75rem", background: "#d1fae5", color: "#065f46", padding: "0.2rem 0.6rem", borderRadius: "999px", fontWeight: 600 }}>
+                  Preserve UMR Rule
+                </span>
+              </div>
+              <p style={{ fontSize: "0.825rem", color: "#047857", marginBottom: "0.75rem" }}>
+                This patient may already have an active UMR. To avoid creating duplicate records, select their existing profile below to generate a new OP token under their original UMR:
+              </p>
+              <div style={{ display: "grid", gap: "0.5rem" }}>
+                {matchingPatients.map((m) => (
+                  <div key={m.patient_id} style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    background: "#ffffff",
+                    padding: "0.6rem 0.9rem",
+                    borderRadius: "8px",
+                    border: "1px solid #a7f3d0"
+                  }}>
+                    <div>
+                      <span style={{ fontWeight: 700, color: "#0f172a" }}>{m.full_name}</span>
+                      <span style={{ marginLeft: "0.5rem", fontSize: "0.75rem", background: "#f1f5f9", padding: "0.15rem 0.45rem", borderRadius: "4px", fontWeight: 600, color: "#334155" }}>
+                        UMR: {m.patient_id}
+                      </span>
+                      <span style={{ marginLeft: "0.5rem", fontSize: "0.8rem", color: "#64748b" }}>
+                        Phone: {m.phone || "N/A"} · {m.gender} · {m.age ? `${m.age} yrs` : ""} · {m.total_op_visits || 0} prev OP visits
+                      </span>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="primary"
+                      style={{ padding: "0.35rem 0.75rem", fontSize: "0.8rem", background: "#059669" }}
+                      onClick={() => handleSelectExisting(m)}
+                    >
+                      Select & Book OP <FiArrowRight style={{ marginLeft: "4px" }} />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : hasEnteredDetails && !checkingMatch ? (
+            <div style={{
+              background: "#eff6ff",
+              border: "1px solid #93c5fd",
+              borderRadius: "10px",
+              padding: "0.75rem 1rem",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              marginBottom: "1rem"
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", color: "#1e40af" }}>
+                <FiUserPlus style={{ fontSize: "1.1rem", color: "#2563eb" }} />
+                <span style={{ fontWeight: 600, fontSize: "0.875rem" }}>
+                  New Patient Confirmed — Unique UMR ({patientId || "PAT-XXXXXX"}) will be generated on registration
+                </span>
+              </div>
+              <span style={{ fontSize: "0.75rem", background: "#dbeafe", color: "#1e40af", padding: "0.2rem 0.6rem", borderRadius: "999px", fontWeight: 600 }}>
+                1 Patient = 1 UMR
+              </span>
+            </div>
+          ) : null}
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1rem", borderBottom: "1px solid #f1f5f9", paddingBottom: "0.75rem" }}>
+          <div>
+            <h2 style={{ fontSize: "1.15rem", fontWeight: 700, margin: 0, color: "#0f172a" }}>Patient Registration Desk</h2>
+            <p style={{ fontSize: "0.8rem", color: "#64748b", margin: "2px 0 0" }}>Register new patient profile and automatically initialize medical record</p>
+          </div>
+          <span style={{ fontSize: "0.825rem", color: "#475569", fontWeight: 600, background: "#f8fafc", padding: "0.3rem 0.75rem", borderRadius: "6px", border: "1px solid #e2e8f0" }}>
+            Assigned UMR: <strong style={{ color: "#0f172a" }}>{patientId || "Generated on Save"}</strong>
+          </span>
+        </div>
+
         {duplicateInfo && (
           <Alert variant="warning">
             Possible duplicate found: {duplicateInfo.name}{" "}
-            {duplicateInfo.last_name} (ID: {duplicateInfo.patient_id})
+            {duplicateInfo.last_name} (UMR: {duplicateInfo.patient_id})
           </Alert>
         )}
+
         <form
           id={registrationFormId}
           className="grid-form patient-grid-form"
@@ -266,13 +390,14 @@ export default function AddPatientPage({
         >
           <Label>
             First Name
-            <Input value={form.name} onChange={handleChange("name")} required />
+            <Input value={form.name} onChange={handleChange("name")} placeholder="e.g. Ravi" required />
           </Label>
           <Label>
             Middle Name
             <Input
               value={form.middle_name}
               onChange={handleChange("middle_name")}
+              placeholder="e.g. Kumar"
             />
           </Label>
           <Label>
@@ -280,6 +405,7 @@ export default function AddPatientPage({
             <Input
               value={form.last_name}
               onChange={handleChange("last_name")}
+              placeholder="e.g. Sharma"
               required
             />
           </Label>
@@ -297,16 +423,18 @@ export default function AddPatientPage({
               type="number"
               value={form.age}
               onChange={handleChange("age")}
+              placeholder="Age in years"
             />
           </Label>
           <Label>
-            Phone
+            Phone Number (10 Digits)
             <Input
               type="tel"
               value={form.phone}
               onChange={handleChange("phone")}
               maxLength={10}
               pattern="\d{10}"
+              placeholder="9876543210"
               required
             />
           </Label>
@@ -316,6 +444,7 @@ export default function AddPatientPage({
               type="number"
               value={form.weight}
               onChange={handleChange("weight")}
+              placeholder="e.g. 68"
             />
           </Label>
           <Label>
@@ -324,14 +453,15 @@ export default function AddPatientPage({
               type="number"
               value={form.height}
               onChange={handleChange("height")}
+              placeholder="e.g. 172"
             />
           </Label>
           <Label>
             Gender
             <Select value={form.gender} onChange={handleChange("gender")}>
-              <option>Male</option>
-              <option>Female</option>
-              <option>Other</option>
+              <option value="Male">Male</option>
+              <option value="Female">Female</option>
+              <option value="Other">Other</option>
             </Select>
           </Label>
           <Label>
@@ -359,30 +489,32 @@ export default function AddPatientPage({
               onChange={handleChange("emergency_contact")}
               maxLength={10}
               pattern="\d{10}"
+              placeholder="10-digit number"
             />
           </Label>
           <Label>
-            Aadhar Number
+            Aadhar / National ID (12 Digits)
             <Input
               type="text"
               value={form.aadhar_number}
               onChange={handleChange("aadhar_number")}
               maxLength={12}
               pattern="\d{12}"
+              placeholder="12-digit number"
             />
           </Label>
           <Label style={{ gridColumn: "1 / -1" }}>
-            Address
-            <Textarea value={form.address} onChange={handleChange("address")} />
+            Full Address
+            <Textarea value={form.address} onChange={handleChange("address")} placeholder="Street, Area, City, Pincode" rows={2} />
           </Label>
         </form>
 
-        <div className="form-actions patient-form-actions patient-actions-bottom">
-          <Button variant="primary" type="submit" form={registrationFormId} disabled={submitting}>
-            {submitting ? "Registering..." : "Register Patient"}
+        <div className="form-actions patient-form-actions patient-actions-bottom" style={{ display: "flex", gap: "0.75rem", marginTop: "1.25rem", borderTop: "1px solid #f1f5f9", paddingTop: "1rem" }}>
+          <Button variant="primary" type="submit" form={registrationFormId}>
+            Register & Proceed to OP Booking
           </Button>
           <Button variant="secondary" type="button" onClick={handleClearForm}>
-            Clear
+            Clear Form
           </Button>
         </div>
       </div>

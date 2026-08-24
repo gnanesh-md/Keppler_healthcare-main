@@ -463,8 +463,8 @@ export const NAV_ITEMS: NavItem[] = [
   // Operations: scheduling first, then the departments doctors refer patients to.
   {
     id: "op-desk",
-    label: "Doctor Scheduling",
-    subtitle: "Manage doctors and outpatient schedules.",
+    label: "OP Desk",
+    subtitle: "Register outpatient visits and manage the OP queue.",
     group: "operations",
     permission: "op.read",
     deniedHint: "Requires doctor scheduling access.",

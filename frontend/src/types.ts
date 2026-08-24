@@ -277,6 +277,9 @@ export interface Appointment {
   patient_name: string;
   patient_phone?: string | null;
   patient_symptoms?: string | null;
+  patient_gender?: string | null;
+  patient_age?: number | string | null;
+  patient_blood_group?: string | null;
   visit_type: string;
   department?: string | null;
   doctor_name?: string | null;
@@ -288,6 +291,18 @@ export interface Appointment {
   reminder_sent_at?: string | null;
   no_show_marked?: boolean | number;
   notes?: string | null;
+  chief_complaint?: string | null;
+  symptoms?: string | null;
+  symptom_duration?: string | null;
+  symptom_severity?: string | null;
+  ai_recommendation?: string | null;
+  gender_preference?: string | null;
+  op_status?: string | null;
+  further_action?: string | null;
+  further_action_notes?: string | null;
+  consultation_fee?: number | string | null;
+  payment_mode?: string | null;
+  encounter_id?: number | null;
   created_at?: string;
 }
 
@@ -307,11 +322,79 @@ export interface DoctorSchedule {
 export interface OpSummary {
   date: string;
   total_appointments: number;
+  new_patients?: number;
   follow_ups: number;
+  awaiting_doctor?: number;
   active_queue: number;
+  in_consultation?: number;
+  completed?: number;
   no_shows: number;
   reminders_sent: number;
   available_doctors: number;
+  busy_doctors?: number;
+  leave_doctors?: number;
+  pending_billing?: number;
+  pending_investigations?: number;
+}
+
+export interface EligibleDoctor {
+  id: number;
+  doctor_name: string;
+  department: string;
+  gender: string;
+  consultation_fee: number;
+  review_fee: number;
+  status: string;
+  current_workload: number;
+  department_matches: boolean;
+  gender_matches: boolean;
+  is_available: boolean;
+  match_score: number;
+}
+
+export interface PatientMatchItem {
+  patient_id: string;
+  name: string;
+  middle_name?: string;
+  last_name?: string;
+  full_name: string;
+  phone?: string;
+  gender?: string;
+  age?: number | string;
+  dob?: string;
+  blood_group?: string;
+  created_at?: string;
+  total_op_visits?: number;
+}
+
+export interface OpTimelineEvent {
+  id: number;
+  hospital_id: number;
+  appointment_id?: number | null;
+  encounter_id?: number | null;
+  patient_id: string;
+  event_name: string;
+  event_description?: string | null;
+  actor?: string | null;
+  created_at: string;
+}
+
+export interface OpPatientHistoryVisit {
+  appointment_id: number;
+  token_no: number;
+  appointment_date: string;
+  doctor_name?: string | null;
+  department?: string | null;
+  status: string;
+  chief_complaint?: string;
+  symptoms?: string;
+  symptom_duration?: string;
+  symptom_severity?: string;
+  further_action?: string;
+  diagnoses?: string[];
+  clinical_notes?: { notes?: string; advice?: string; follow_up?: string; created_at?: string }[];
+  prescriptions?: { id: number; doctor_username?: string; medicines?: any[]; created_at?: string }[];
+  vitals?: any[];
 }
 
 export interface Certificate {

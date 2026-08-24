@@ -163,7 +163,7 @@ def appointments_create():
     if validation_error:
         return validation_error
 
-    appointment_id, token_no = create_appointment(
+    appointment_id, token_no, patient_id = create_appointment(
         payload, hospital_id=current_hospital_id()
     )
 
@@ -174,7 +174,7 @@ def appointments_create():
         invoice_id = create_invoice(
             {
                 "invoice_no": invoice_no,
-                "patient_id": payload.get("patient_id"),
+                "patient_id": patient_id,
                 "module": "OP",
                 "doctor_name": payload.get("doctor_name"),
                 "total_amount": consultation_fee,
@@ -185,6 +185,8 @@ def appointments_create():
                 "created_by": (
                     g.current_user.get("username") if hasattr(g, "current_user") else ""
                 ),
+                "appointment_id": appointment_id,
+                "encounter_id": payload.get("encounter_id"),
             },
             hospital_id=current_hospital_id(),
         )
@@ -206,9 +208,9 @@ def appointments_create():
         "create",
         "appointments",
         str(appointment_id),
-        {"patient_name": payload.get("patient_name"), "token_no": token_no},
+        {"patient_name": payload.get("patient_name"), "token_no": token_no, "patient_id": patient_id},
     )
-    return jsonify({"appointment_id": appointment_id, "token_no": token_no})
+    return jsonify({"appointment_id": appointment_id, "token_no": token_no, "op_number": token_no, "patient_id": patient_id})
 
 
 @appointments_bp.put("/api/appointments/<int:appointment_id>")
@@ -316,7 +318,7 @@ def appointments_razorpay_verify():
     if appointment_validation:
         return appointment_validation
 
-    appointment_id, token_no = create_appointment(
+    appointment_id, token_no, patient_id = create_appointment(
         {
             "patient_id": appointment_payload.get("patient_id"),
             "patient_name": appointment_payload.get("patient_name"),

@@ -24,10 +24,14 @@ import {
   FiPlus,
   FiArrowLeft,
   FiList,
+  FiTrash2,
+  FiFolder,
+  FiExternalLink,
+  FiCheck,
 } from "react-icons/fi";
 import { apiFetch, reportError } from "../lib/api";
 import { updateAppointmentStatus } from "../lib/appointments";
-import type { Appointment, Notice, User } from "../types";
+import type { Appointment, Notice, User, OpPatientHistoryVisit } from "../types";
 import PrescriptionUploadModal from "../components/PrescriptionUploadModal";
 import { formatDateTime } from "../lib/format";
 
@@ -485,6 +489,26 @@ export default function DoctorPrescriptionPage({
   );
   const [schedLoading, setSchedLoading] = useState(false);
 
+  /* — OP Structured Consultation State — */
+  const [consultationDiagnosis, setConsultationDiagnosis] = useState("");
+  const [consultationAdvice, setConsultationAdvice] = useState("");
+  const [consultationFollowUp, setConsultationFollowUp] = useState("");
+  const [consultationFurtherAction, setConsultationFurtherAction] = useState("none");
+  const [consultationFurtherNotes, setConsultationFurtherNotes] = useState("");
+  const [consultationMedicines, setConsultationMedicines] = useState<
+    Array<{ name: string; dosage: string; frequency: string; duration: string; instructions: string }>
+  >([
+    { name: "", dosage: "500mg", frequency: "1-0-1", duration: "5 days", instructions: "After food" },
+  ]);
+  const [consultationTests, setConsultationTests] = useState<string[]>([]);
+  const [testInput, setTestInput] = useState("");
+  const [savingConsultation, setSavingConsultation] = useState(false);
+
+  /* — Past OP History under UMR — */
+  const [patientOpHistory, setPatientOpHistory] = useState<OpPatientHistoryVisit[]>([]);
+  const [loadingOpHistory, setLoadingOpHistory] = useState(false);
+  const [showOpHistory, setShowOpHistory] = useState(false);
+
   /* — prescription upload — */
   const [uploadTarget, setUploadTarget] = useState<{
     id: string;
@@ -498,6 +522,61 @@ export default function DoctorPrescriptionPage({
 
   /* — refresh timer ref — */
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const loadPatientOpHistory = useCallback(async (pid: string) => {
+    if (!pid) return;
+    setLoadingOpHistory(true);
+    try {
+      const res = await apiFetch<{ visits: OpPatientHistoryVisit[] }>(`/api/op/patients/${encodeURIComponent(pid)}/history`);
+      setPatientOpHistory(res.visits || []);
+    } catch {
+      setPatientOpHistory([]);
+    } finally {
+      setLoadingOpHistory(false);
+    }
+  }, []);
+
+  const handleSaveOpConsultation = async (appt: Appointment) => {
+    const validMeds = consultationMedicines.filter((m) => m.name.trim());
+    if (!consultationDiagnosis.trim() && validMeds.length === 0 && !consultationAdvice.trim()) {
+      setNotice({ type: "warning", message: "Please enter a diagnosis, advice, or prescription medicines." });
+      return;
+    }
+    setSavingConsultation(true);
+    try {
+      await apiFetch(`/api/op/visits/${appt.id}/consultation`, {
+        method: "PUT",
+        body: JSON.stringify({
+          diagnosis: consultationDiagnosis.trim() || undefined,
+          advice: consultationAdvice.trim() || undefined,
+          follow_up: consultationFollowUp.trim() || undefined,
+          further_action: consultationFurtherAction || "none",
+          further_action_notes: consultationFurtherNotes.trim() || undefined,
+          medicines: validMeds.length > 0 ? validMeds : undefined,
+          tests: consultationTests.length > 0 ? consultationTests : undefined,
+        }),
+      });
+      setNotice({
+        type: "success",
+        message: `Consultation recorded for OP #${appt.token_no} (${appt.patient_name}). Next Action: ${consultationFurtherAction.toUpperCase()}`,
+      });
+      setConsultationDiagnosis("");
+      setConsultationAdvice("");
+      setConsultationFollowUp("");
+      setConsultationFurtherAction("none");
+      setConsultationFurtherNotes("");
+      setConsultationMedicines([{ name: "", dosage: "500mg", frequency: "1-0-1", duration: "5 days", instructions: "After food" }]);
+      setConsultationTests([]);
+      await loadQueue(true);
+      if (queue.length > 0) {
+        await updateAppointmentStatus(queue[0].id, "in_consultation");
+      }
+    } catch (err) {
+      reportError(setNotice, err as { message?: string }, "Failed to save OP consultation.");
+    } finally {
+      setSavingConsultation(false);
+    }
+  };
 
   /* ── loaders ── */
   const loadQueue = useCallback(
@@ -1592,6 +1671,323 @@ export default function DoctorPrescriptionPage({
                               </div>
                             )}
 
+                            {/* Previous OP Visits Under this UMR */}
+                            {appt.patient_id && (
+                              <div style={{ background: "#f8fafc", borderRadius: "10px", border: `1px solid ${C.borderLight}`, padding: "1rem" }}>
+                                <div
+                                  style={{ display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer" }}
+                                  onClick={() => setShowOpHistory((prev) => !prev)}
+                                >
+                                  <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", fontWeight: 700, fontSize: "0.85rem", color: C.text }}>
+                                    <FiFolder style={{ color: "#0284c7" }} />
+                                    <span>Past OP Encounters for UMR {appt.patient_id} ({patientOpHistory.length} previous visits)</span>
+                                  </div>
+                                  <span style={{ fontSize: "0.75rem", color: "#0284c7", fontWeight: 600 }}>
+                                    {showOpHistory ? "Hide History ▲" : "View History ▼"}
+                                  </span>
+                                </div>
+
+                                {showOpHistory && (
+                                  <div style={{ marginTop: "0.75rem", display: "grid", gap: "0.5rem" }}>
+                                    {loadingOpHistory ? (
+                                      <p style={{ fontSize: "0.8rem", color: C.textFaint }}>Loading visit history...</p>
+                                    ) : patientOpHistory.length === 0 ? (
+                                      <p style={{ fontSize: "0.8rem", color: C.textFaint }}>No previous OP visits recorded for this patient.</p>
+                                    ) : (
+                                      patientOpHistory.map((h) => (
+                                        <div key={h.appointment_id} style={{ background: "#ffffff", padding: "0.6rem 0.8rem", borderRadius: "6px", border: `1px solid ${C.border}` }}>
+                                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.25rem" }}>
+                                            <span style={{ fontWeight: 700, fontSize: "0.8rem", color: "#0f172a" }}>
+                                              OP #{h.token_no} · {formatDateTime(h.appointment_date)}
+                                            </span>
+                                            <span style={{ fontSize: "0.7rem", padding: "0.1rem 0.4rem", borderRadius: "4px", background: "#e0f2fe", color: "#0369a1", fontWeight: 600 }}>
+                                              Dr. {h.doctor_name || "General"} ({h.department || "OP"})
+                                            </span>
+                                          </div>
+                                          {h.chief_complaint && (
+                                            <div style={{ fontSize: "0.78rem", color: "#475569" }}>
+                                              <strong>Complaint:</strong> {h.chief_complaint}
+                                            </div>
+                                          )}
+                                          {h.diagnoses && h.diagnoses.length > 0 && (
+                                            <div style={{ fontSize: "0.78rem", color: "#059669" }}>
+                                              <strong>Diagnosis:</strong> {h.diagnoses.join(", ")}
+                                            </div>
+                                          )}
+                                        </div>
+                                      ))
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            {/* Live Structured OP Consultation & Rx Builder */}
+                            <div style={{ background: "#ffffff", borderRadius: "10px", border: "1.5px solid #cbd5e1", padding: "1.25rem" }}>
+                              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1rem", borderBottom: "1px solid #f1f5f9", paddingBottom: "0.5rem" }}>
+                                <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontWeight: 700, fontSize: "0.95rem", color: "#0f172a" }}>
+                                  <FiEdit3 style={{ color: "#059669" }} />
+                                  <span>Clinical Consultation & Prescription</span>
+                                </div>
+                                <span style={{ fontSize: "0.75rem", background: "#ecfdf5", color: "#065f46", padding: "0.15rem 0.5rem", borderRadius: "4px", fontWeight: 600 }}>
+                                  OP Encounter Active
+                                </span>
+                              </div>
+
+                              {/* Diagnosis */}
+                              <div style={{ marginBottom: "1rem" }}>
+                                <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 700, color: "#334155", marginBottom: "0.3rem" }}>
+                                  Clinical Diagnosis / Impression
+                                </label>
+                                <Inp
+                                  value={consultationDiagnosis}
+                                  onChange={(e) => setConsultationDiagnosis(e.target.value)}
+                                  placeholder="e.g. Acute Bronchitis, Essential Hypertension"
+                                />
+                              </div>
+
+                              {/* Prescriptions Medicines Table */}
+                              <div style={{ marginBottom: "1rem" }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.4rem" }}>
+                                  <label style={{ fontSize: "0.8rem", fontWeight: 700, color: "#334155" }}>
+                                    Prescription Medications ({consultationMedicines.length})
+                                  </label>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="secondary"
+                                    onClick={() =>
+                                      setConsultationMedicines((prev) => [
+                                        ...prev,
+                                        { name: "", dosage: "500mg", frequency: "1-0-1", duration: "5 days", instructions: "After food" },
+                                      ])
+                                    }
+                                  >
+                                    <FiPlus style={{ marginRight: "3px" }} /> Add Drug
+                                  </Button>
+                                </div>
+
+                                <div style={{ display: "grid", gap: "0.5rem" }}>
+                                  {consultationMedicines.map((med, idx) => (
+                                    <div key={idx} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1.5fr auto", gap: "0.4rem", alignItems: "center", background: "#f8fafc", padding: "0.5rem", borderRadius: "6px", border: "1px solid #e2e8f0" }}>
+                                      <input
+                                        placeholder="Medicine name (e.g. Amoxicillin)"
+                                        value={med.name}
+                                        onChange={(e) => {
+                                          const val = e.target.value;
+                                          setConsultationMedicines((prev) => {
+                                            const copy = [...prev];
+                                            copy[idx].name = val;
+                                            return copy;
+                                          });
+                                        }}
+                                        style={{ padding: "0.4rem 0.6rem", borderRadius: "4px", border: "1px solid #cbd5e1", fontSize: "0.8rem" }}
+                                      />
+                                      <input
+                                        placeholder="Dose (500mg)"
+                                        value={med.dosage}
+                                        onChange={(e) => {
+                                          const val = e.target.value;
+                                          setConsultationMedicines((prev) => {
+                                            const copy = [...prev];
+                                            copy[idx].dosage = val;
+                                            return copy;
+                                          });
+                                        }}
+                                        style={{ padding: "0.4rem 0.6rem", borderRadius: "4px", border: "1px solid #cbd5e1", fontSize: "0.8rem" }}
+                                      />
+                                      <select
+                                        value={med.frequency}
+                                        onChange={(e) => {
+                                          const val = e.target.value;
+                                          setConsultationMedicines((prev) => {
+                                            const copy = [...prev];
+                                            copy[idx].frequency = val;
+                                            return copy;
+                                          });
+                                        }}
+                                        style={{ padding: "0.4rem 0.6rem", borderRadius: "4px", border: "1px solid #cbd5e1", fontSize: "0.8rem" }}
+                                      >
+                                        <option value="1-0-1">1-0-1 (BD)</option>
+                                        <option value="1-1-1">1-1-1 (TDS)</option>
+                                        <option value="1-0-0">1-0-0 (OD)</option>
+                                        <option value="0-0-1">0-0-1 (Night)</option>
+                                        <option value="SOS">SOS (When needed)</option>
+                                      </select>
+                                      <input
+                                        placeholder="Duration (5d)"
+                                        value={med.duration}
+                                        onChange={(e) => {
+                                          const val = e.target.value;
+                                          setConsultationMedicines((prev) => {
+                                            const copy = [...prev];
+                                            copy[idx].duration = val;
+                                            return copy;
+                                          });
+                                        }}
+                                        style={{ padding: "0.4rem 0.6rem", borderRadius: "4px", border: "1px solid #cbd5e1", fontSize: "0.8rem" }}
+                                      />
+                                      <input
+                                        placeholder="Instructions (After food)"
+                                        value={med.instructions}
+                                        onChange={(e) => {
+                                          const val = e.target.value;
+                                          setConsultationMedicines((prev) => {
+                                            const copy = [...prev];
+                                            copy[idx].instructions = val;
+                                            return copy;
+                                          });
+                                        }}
+                                        style={{ padding: "0.4rem 0.6rem", borderRadius: "4px", border: "1px solid #cbd5e1", fontSize: "0.8rem" }}
+                                      />
+                                      {consultationMedicines.length > 1 && (
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            setConsultationMedicines((prev) => prev.filter((_, i) => i !== idx))
+                                          }
+                                          style={{ background: "transparent", border: "none", color: "#ef4444", cursor: "pointer" }}
+                                        >
+                                          <FiTrash2 />
+                                        </button>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+
+                              {/* Diagnostic Investigations */}
+                              <div style={{ marginBottom: "1rem" }}>
+                                <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 700, color: "#334155", marginBottom: "0.3rem" }}>
+                                  Order Diagnostic / Lab Tests
+                                </label>
+                                <div style={{ display: "flex", gap: "0.5rem" }}>
+                                  <input
+                                    placeholder="Add test (e.g. CBC, Lipid Profile, Chest X-Ray)..."
+                                    value={testInput}
+                                    onChange={(e) => setTestInput(e.target.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter" && testInput.trim()) {
+                                        e.preventDefault();
+                                        setConsultationTests((prev) => [...prev, testInput.trim()]);
+                                        setTestInput("");
+                                      }
+                                    }}
+                                    style={{ flex: 1, padding: "0.45rem 0.75rem", borderRadius: "6px", border: "1px solid #cbd5e1", fontSize: "0.825rem" }}
+                                  />
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="secondary"
+                                    onClick={() => {
+                                      if (testInput.trim()) {
+                                        setConsultationTests((prev) => [...prev, testInput.trim()]);
+                                        setTestInput("");
+                                      }
+                                    }}
+                                  >
+                                    Add Test
+                                  </Button>
+                                </div>
+                                {consultationTests.length > 0 && (
+                                  <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", marginTop: "0.5rem" }}>
+                                    {consultationTests.map((t, idx) => (
+                                      <span key={idx} style={{ background: "#e0e7ff", color: "#3730a3", fontSize: "0.75rem", padding: "0.2rem 0.5rem", borderRadius: "4px", display: "flex", alignItems: "center", gap: "0.3rem", fontWeight: 600 }}>
+                                        {t}
+                                        <button
+                                          type="button"
+                                          onClick={() => setConsultationTests((prev) => prev.filter((_, i) => i !== idx))}
+                                          style={{ border: "none", background: "transparent", color: "#4338ca", cursor: "pointer", fontSize: "0.8rem" }}
+                                        >
+                                          ×
+                                        </button>
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* Clinical Advice & Follow-up */}
+                              <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: "0.75rem", marginBottom: "1rem" }}>
+                                <div>
+                                  <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 700, color: "#334155", marginBottom: "0.3rem" }}>
+                                    Clinical Advice / Dietary Instructions
+                                  </label>
+                                  <input
+                                    value={consultationAdvice}
+                                    onChange={(e) => setConsultationAdvice(e.target.value)}
+                                    placeholder="e.g. Adequate rest, hydrate, low sodium diet"
+                                    style={{ width: "100%", padding: "0.45rem 0.75rem", borderRadius: "6px", border: "1px solid #cbd5e1", fontSize: "0.825rem", boxSizing: "border-box" }}
+                                  />
+                                </div>
+                                <div>
+                                  <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 700, color: "#334155", marginBottom: "0.3rem" }}>
+                                    Follow-up Timeline
+                                  </label>
+                                  <input
+                                    value={consultationFollowUp}
+                                    onChange={(e) => setConsultationFollowUp(e.target.value)}
+                                    placeholder="e.g. 5 days, 1 week"
+                                    style={{ width: "100%", padding: "0.45rem 0.75rem", borderRadius: "6px", border: "1px solid #cbd5e1", fontSize: "0.825rem", boxSizing: "border-box" }}
+                                  />
+                                </div>
+                              </div>
+
+                              {/* Further Action Routing */}
+                              <div style={{ background: "#f1f5f9", padding: "0.85rem", borderRadius: "8px", marginBottom: "1.25rem" }}>
+                                <label style={{ display: "block", fontSize: "0.8rem", fontWeight: 700, color: "#0f172a", marginBottom: "0.4rem" }}>
+                                  Post-Consultation Routing & Further Action
+                                </label>
+                                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.6rem" }}>
+                                  <select
+                                    value={consultationFurtherAction}
+                                    onChange={(e) => setConsultationFurtherAction(e.target.value)}
+                                    style={{ padding: "0.5rem", borderRadius: "6px", border: "1px solid #cbd5e1", fontSize: "0.85rem", fontWeight: 600 }}
+                                  >
+                                    <option value="none">None (OP Encounter Completed)</option>
+                                    <option value="pharmacy">Route to Pharmacy (Collect Rx)</option>
+                                    <option value="laboratory">Route to Laboratory (Sample Collection)</option>
+                                    <option value="imaging">Route to Imaging / Radiology</option>
+                                    <option value="referral">Specialist Referral</option>
+                                    <option value="admission">Admit to Inpatient Ward (IP)</option>
+                                  </select>
+                                  <input
+                                    value={consultationFurtherNotes}
+                                    onChange={(e) => setConsultationFurtherNotes(e.target.value)}
+                                    placeholder="Optional instructions for next department..."
+                                    style={{ padding: "0.5rem 0.75rem", borderRadius: "6px", border: "1px solid #cbd5e1", fontSize: "0.825rem" }}
+                                  />
+                                </div>
+                              </div>
+
+                              {/* Submit Consultation Button */}
+                              <div style={{ display: "flex", justifyContent: "flex-end", gap: "0.75rem" }}>
+                                <Btn
+                                  variant="secondary"
+                                  size="md"
+                                  onClick={() =>
+                                    setUploadTarget({
+                                      id: String(appt.patient_id),
+                                      name: appt.patient_name,
+                                      doctorName: appt.doctor_name ?? undefined,
+                                      mode: "ocr",
+                                    })
+                                  }
+                                >
+                                  <FiUploadCloud size={14} /> Scan Paper Rx
+                                </Btn>
+                                <Btn
+                                  variant="success"
+                                  size="md"
+                                  style={{ background: "#059669", padding: "0.6rem 1.4rem" }}
+                                  onClick={() => void handleSaveOpConsultation(appt)}
+                                  disabled={savingConsultation}
+                                >
+                                  {savingConsultation ? "Saving..." : "💾 Complete Consultation & Route Action"}
+                                </Btn>
+                              </div>
+                            </div>
+
                             {/* Action buttons */}
                             <div
                               style={{
@@ -1621,62 +2017,6 @@ export default function DoctorPrescriptionPage({
                                   <div
                                     style={{
                                       display: "grid",
-                                      gridTemplateColumns: "1fr 1fr 1fr",
-                                      gap: "0.8rem",
-                                    }}
-                                  >
-                                    <Btn
-                                      variant="primary"
-                                      style={{ justifyContent: "center" }}
-                                      onClick={() =>
-                                        setUploadTarget({
-                                          id: String(appt.patient_id),
-                                          name: appt.patient_name,
-                                          doctorName:
-                                            appt.doctor_name ?? undefined,
-                                          mode: "manual",
-                                        })
-                                      }
-                                    >
-                                      ✏️ Write Prescription
-                                    </Btn>
-                                    <Btn
-                                      variant="secondary"
-                                      style={{ justifyContent: "center" }}
-                                      onClick={() =>
-                                        setUploadTarget({
-                                          id: String(appt.patient_id),
-                                          name: appt.patient_name,
-                                          doctorName:
-                                            appt.doctor_name ?? undefined,
-                                          mode: "ocr",
-                                        })
-                                      }
-                                    >
-                                      <FiUploadCloud size={14} /> Scan
-                                      Prescription
-                                    </Btn>
-                                    <Btn
-                                      variant="secondary"
-                                      style={{ justifyContent: "center" }}
-                                      onClick={() => {
-                                        setTab("notes");
-                                      }}
-                                    >
-                                      <FiEdit3 size={14} /> Write Clinical Note
-                                    </Btn>
-                                  </div>
-
-                                  <div
-                                    style={{
-                                      height: 1,
-                                      background: C.borderLight,
-                                    }}
-                                  />
-
-                                  <div
-                                    style={{
-                                      display: "grid",
                                       gridTemplateColumns: "1fr 1fr",
                                       gap: "0.8rem",
                                     }}
@@ -1689,7 +2029,7 @@ export default function DoctorPrescriptionPage({
                                         onNavigate?.("pharmacy");
                                       }}
                                     >
-                                      <FiCheckCircle size={14} /> Complete Only
+                                      <FiCheckCircle size={14} /> Finish Consultation
                                     </Btn>
                                     <Btn
                                       variant="success"
@@ -1698,7 +2038,7 @@ export default function DoctorPrescriptionPage({
                                         void doCompleteAndNext(appt.id)
                                       }
                                     >
-                                      Complete & Call Next{" "}
+                                      Finish & Call Next{" "}
                                       <FiArrowRightCircle size={15} />
                                     </Btn>
                                   </div>

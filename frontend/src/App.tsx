@@ -43,6 +43,7 @@ const DoctorPrescriptionPage = lazy(
 const EmrPage = lazy(() => import("./pages/EmrPage"));
 const RegistrationDeskPage = lazy(() => import("./pages/RegistrationDeskPage"));
 const BulkPatientAiPage = lazy(() => import("./pages/BulkPatientAiPage"));
+const OpPage = lazy(() => import("./pages/OpPage"));
 import {
   API_BASE,
   EMPTY_STATS,
@@ -1757,13 +1758,15 @@ function App() {
                 />
               )}
 
-            {page === "op-desk" && hasPermission("op.read") && (
-              <DoctorSchedulingPage
+            {(page === "op-desk" || page === "op") && (hasPermission("op.read") || isAdmin) && (
+              <OpPage
                 setNotice={setNotice}
                 canEdit={
                   hasPermission("op.schedules.write") ||
-                  hasPermission("op.doctors.write")
+                  hasPermission("op.doctors.write") ||
+                  isAdmin
                 }
+                onNavigate={navigateToPage}
               />
             )}
 

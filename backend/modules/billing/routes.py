@@ -90,6 +90,8 @@ def billing_create_invoice():
             "refunded_amount": payload.get("refunded_amount", 0),
             "payment_status": payload.get("payment_status", "due"),
             "created_by": g.current_user.get("username"),
+            "appointment_id": payload.get("appointment_id"),
+            "encounter_id": payload.get("encounter_id"),
         },
         hospital_id=current_hospital_id(),
     )
