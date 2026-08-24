@@ -1,12 +1,23 @@
 import { useEffect, useMemo, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
-import { FiCalendar } from "react-icons/fi";
+import {
+  FiCalendar,
+  FiUserCheck,
+  FiActivity,
+  FiCpu,
+  FiClock,
+  FiCheckCircle,
+  FiAlertCircle,
+  FiZap,
+  FiUsers,
+  FiArrowRight,
+} from "react-icons/fi";
 import { Button, Input, Label, Select, Textarea } from "../components/ui";
 import { apiFetch, reportError } from "../lib/api";
 import { SYMPTOM_API_BASE } from "../lib/constants";
 import { updateAppointmentStatus as putAppointmentStatus } from "../lib/appointments";
 import { openRazorpayCheckout } from "../lib/razorpay";
-import type { Appointment, Notice, Patient } from "../types";
+import type { Appointment, Notice, Patient, EligibleDoctor } from "../types";
 import PatientAutocomplete from "../components/PatientAutocomplete";
 
 import AppointmentQueueCard from "../components/AppointmentQueueCard";
@@ -19,7 +30,7 @@ type Props = {
   selectedPatient: Patient | null;
   setNotice: Dispatch<SetStateAction<Notice | null>>;
   onNavigate?: (page: string, extraData?: any) => void;
-  prefillData?: { doctorName?: string; department?: string } | null;
+  prefillData?: { doctorName?: string; department?: string; patient_id?: string; patient_name?: string } | null;
 };
 
 type Department = {
@@ -50,13 +61,22 @@ type InsuranceRecord = {
 const DEFAULT_APPOINTMENT_FORM = {
   patient_id: "",
   patient_name: "",
+  patient_gender: "Male",
+  patient_age: "",
+  patient_phone: "",
   visit_type: "OP",
   department: "",
   doctor_name: "",
   appointment_date: "",
   consultation_fee: "0",
-  payment_mode: "upi",
+  payment_mode: "cash",
   notes: "",
+  chief_complaint: "",
+  symptoms: "",
+  symptom_duration: "",
+  symptom_severity: "moderate",
+  gender_preference: "",
+  ai_recommendation: "",
 };
 
 const DEFAULT_CONSENT_FORM = {
@@ -102,10 +122,26 @@ export default function RegistrationDeskPage({
     {
       doctor_name?: string | null;
       department?: string | null;
+      gender?: string | null;
       consultation_fee?: string | number;
       status?: string | null;
     }[]
   >([]);
+
+  // OP Doctor Matching & Gender Rule State
+  const [loadedPatient, setLoadedPatient] = useState<Patient | null>(selectedPatient || null);
+  const [eligibleDoctors, setEligibleDoctors] = useState<EligibleDoctor[]>([]);
+  const [recommendedDoctor, setRecommendedDoctor] = useState<EligibleDoctor | null>(null);
+  const [recommendationAction, setRecommendationAction] = useState<string>("assign");
+  const [loadingEligibleDocs, setLoadingEligibleDocs] = useState(false);
+  const [registeredOpModalData, setRegisteredOpModalData] = useState<{
+    patient_id: string;
+    token_no: number;
+    patient_name: string;
+    doctor_name: string;
+    department: string;
+    consultation_fee: number;
+  } | null>(null);
 
   const [consents, setConsents] = useState<ConsentRecord[]>([]);
   const [insuranceChecks, setInsuranceChecks] = useState<InsuranceRecord[]>([]);
@@ -124,6 +160,36 @@ export default function RegistrationDeskPage({
     ...DEFAULT_INSURANCE_FORM,
   });
 
+  const loadEligibleDoctors = async (dept?: string, patGender?: string) => {
+    setLoadingEligibleDocs(true);
+    try {
+      const pGender = patGender !== undefined && patGender !== "" ? patGender : (loadedPatient?.gender || appointmentForm.patient_gender || selectedPatient?.gender || "Male");
+      const d = dept !== undefined ? dept : appointmentForm.department;
+      const res = await apiFetch<{
+        doctors: EligibleDoctor[];
+        recommended_doctor: EligibleDoctor | null;
+        recommendation_action: string;
+      }>(
+        `/api/op/doctors/eligible?department=${encodeURIComponent(d || "")}&patient_gender=${encodeURIComponent(pGender)}`
+      );
+      setEligibleDoctors(res.doctors || []);
+      setRecommendedDoctor(res.recommended_doctor || null);
+      setRecommendationAction(res.recommendation_action || "assign");
+      if (res.recommended_doctor) {
+        setAppointmentForm((prev) => ({
+          ...prev,
+          department: res.recommended_doctor?.department || prev.department || d || "Medicine",
+          doctor_name: res.recommended_doctor?.doctor_name || prev.doctor_name,
+          consultation_fee: res.recommended_doctor?.consultation_fee != null ? String(res.recommended_doctor.consultation_fee) : prev.consultation_fee,
+        }));
+      }
+    } catch {
+      // fallback
+    } finally {
+      setLoadingEligibleDocs(false);
+    }
+  };
+
   useEffect(() => {
     if (prefillData) {
       setAppointmentForm((prev) => {
@@ -140,6 +206,8 @@ export default function RegistrationDeskPage({
         }
         return {
           ...prev,
+          patient_id: prefillData.patient_id || prev.patient_id,
+          patient_name: prefillData.patient_name || prev.patient_name,
           department: prefillData.department || prev.department,
           doctor_name: prefillData.doctorName || prev.doctor_name,
           consultation_fee: nextFee,
@@ -148,12 +216,116 @@ export default function RegistrationDeskPage({
     }
   }, [prefillData, doctors]);
 
+  useEffect(() => {
+    if (appointmentForm.visit_type === "OP") {
+      void loadEligibleDoctors(appointmentForm.department, appointmentForm.patient_gender || selectedPatient?.gender || "Male", appointmentForm.gender_preference);
+    }
+  }, [appointmentForm.department, appointmentForm.gender_preference, appointmentForm.patient_gender, selectedPatient?.gender, appointmentForm.visit_type]);
+
+  const detectDepartmentFromSymptoms = (text: string): string | null => {
+    if (!text || text.trim().length < 2) return null;
+    const lower = text.toLowerCase();
+    
+    if (/\b(chest|heart|palpitat|breathless|cardio|angina|tachycardia|ecg|hypertens|bp\b|pressure)\b/i.test(lower)) {
+      return "Cardiology";
+    }
+    if (/\b(knee|bone|fractur|joint|sprain|ortho|spine|back pain|arthritis|ligament|swollen ankle|shoulder)\b/i.test(lower)) {
+      return "Orthopedics";
+    }
+    if (/\b(skin|rash|itch|acne|dermat|pimples|eczema|fungal|allergy|psoriasis|boil)\b/i.test(lower)) {
+      return "Dermatology";
+    }
+    if (/\b(child|baby|infant|pediatric|toddler|vaccin|immuniz|newborn)\b/i.test(lower)) {
+      return "Pediatrics";
+    }
+    if (/\b(pregnan|prenatal|period|menstrua|gynec|pelvic|ovary|uterus|cramp|delivery)\b/i.test(lower)) {
+      return "Gynecology";
+    }
+    if (/\b(migraine|seizur|fits|nerve|stroke|numb|paralys|neuro|epilepsy|tremor|memory)\b/i.test(lower)) {
+      return "Neurology";
+    }
+    if (/\b(ear|sinus|throat|tonsil|hearing|nose bleed|ent|nasal|hoarse)\b/i.test(lower)) {
+      return "ENT";
+    }
+    if (/\b(fever|cold|cough|weakness|fatigue|infect|body pain|chill|viral|malaise|typhoid|malaria|diabet|headache|vomit|diarrhea|nausea|dizz)\b/i.test(lower)) {
+      return "Medicine";
+    }
+    return null;
+  };
+
+  const handleSymptomOrComplaintChange = (field: "chief_complaint" | "symptoms", val: string) => {
+    setAppointmentForm((prev) => {
+      const next = { ...prev, [field]: val };
+      const combined = `${next.chief_complaint || ""} ${next.symptoms || ""}`.trim();
+      const detectedDept = detectDepartmentFromSymptoms(combined);
+      if (detectedDept && detectedDept !== prev.department) {
+        next.department = detectedDept;
+        const curGender = loadedPatient?.gender || prev.patient_gender || "Male";
+        void loadEligibleDoctors(detectedDept, curGender);
+      }
+      return next;
+    });
+  };
+
   const [symptomsText, setSymptomsText] = useState("");
   const [triageLoading, setTriageLoading] = useState(false);
   const [triageResult, setTriageResult] = useState<{
     urgency?: string;
     reasoning?: string;
   } | null>(null);
+
+  const handleAITriage = async () => {
+    setTriageLoading(true);
+    try {
+      const combined = `${appointmentForm.chief_complaint || ""} ${symptomsText || appointmentForm.symptoms || ""}`.trim();
+      const detectedDept = detectDepartmentFromSymptoms(combined) || "Medicine";
+      const curGender = loadedPatient?.gender || appointmentForm.patient_gender || "Male";
+      
+      let urgency = "Moderate";
+      let reasoning = `Patient symptoms indicate ${detectedDept} consultation. Auto-assigned ${detectedDept} specialist.`;
+      
+      try {
+        const res = await apiFetch<{
+          recommended_specialty?: string;
+          urgency?: string;
+          reasoning?: string;
+        }>("/api/op/ai/triage", {
+          method: "POST",
+          body: JSON.stringify({
+            chief_complaint: appointmentForm.chief_complaint,
+            symptoms: combined,
+            symptom_severity: appointmentForm.symptom_severity,
+            patient_gender: curGender,
+          }),
+        });
+        if (res.recommended_specialty) {
+          const apiDept = res.recommended_specialty;
+          urgency = res.urgency || urgency;
+          reasoning = res.reasoning || reasoning;
+          setAppointmentForm((prev) => ({
+            ...prev,
+            department: apiDept,
+            ai_recommendation: `${apiDept} - ${urgency}`,
+          }));
+          void loadEligibleDoctors(apiDept, curGender);
+          setTriageResult({ urgency, reasoning });
+          return;
+        }
+      } catch {
+        // use local rule detection fallback
+      }
+
+      setAppointmentForm((prev) => ({
+        ...prev,
+        department: detectedDept,
+        ai_recommendation: `${detectedDept} - ${urgency}`,
+      }));
+      void loadEligibleDoctors(detectedDept, curGender);
+      setTriageResult({ urgency, reasoning });
+    } finally {
+      setTriageLoading(false);
+    }
+  };
 
   const loadAppointments = async () => {
     setAppointmentsLoading(true);
@@ -368,62 +540,7 @@ export default function RegistrationDeskPage({
       .catch(() => setIsRazorpayReady(true));
   }, []);
 
-  const handleAITriage = async () => {
-    if (!symptomsText.trim()) {
-      setNotice({
-        type: "warning",
-        message: "Please enter patient symptoms first.",
-      });
-      return;
-    }
-    setTriageLoading(true);
-    try {
-      // Pass all registered departments, even if no doctors are currently available.
-      const availableDepartments = Array.from(
-        new Set([
-          ...departments.map((d) => d.department_name),
-          ...doctors.map((doc) => doc.department),
-        ]),
-      ).filter(Boolean) as string[];
 
-      const availableDoctors = Array.from(
-        new Set(
-          doctors.map(
-            (doc) => `${doc.doctor_name} (${doc.department || "General"})`,
-          ),
-        ),
-      ).filter(Boolean) as string[];
-
-      const res = await apiFetch<{
-        department?: string;
-        urgency?: string;
-        reasoning?: string;
-        doctor?: string;
-      }>("/api/symptom-ai/triage", {
-        method: "POST",
-        body: JSON.stringify({
-          symptoms: symptomsText,
-          available_departments: availableDepartments,
-          available_doctors: availableDoctors,
-        }),
-      });
-      if (res.department) {
-        handleDepartmentChange(res.department);
-      }
-      if (res.doctor && res.doctor.trim()) {
-        handleDoctorChange(res.doctor.trim());
-      }
-      setTriageResult({ urgency: res.urgency, reasoning: res.reasoning });
-    } catch (error) {
-      reportError(
-        setNotice,
-        error as { message?: string },
-        "Unable to get AI triage recommendation.",
-      );
-    } finally {
-      setTriageLoading(false);
-    }
-  };
 
   const ensureRazorpayConfigured = async () => {
     try {
@@ -516,7 +633,8 @@ export default function RegistrationDeskPage({
     }
     setSavingAppointment(true);
     try {
-      const data = await apiFetch<{ token_no: number }>("/api/appointments", {
+      const isOp = appointmentForm.visit_type === "OP";
+      const data = await apiFetch<{ token_no: number; op_number?: number; appointment_id?: number; patient_id?: string }>("/api/appointments", {
         method: "POST",
         body: JSON.stringify({
           patient_id:
@@ -524,30 +642,54 @@ export default function RegistrationDeskPage({
             selectedPatient?.patient_id ||
             undefined,
           patient_name: patientName,
+          patient_gender: appointmentForm.patient_gender || "Male",
+          patient_phone: appointmentForm.patient_phone || undefined,
+          patient_age: appointmentForm.patient_age ? Number(appointmentForm.patient_age) : undefined,
           visit_type: appointmentForm.visit_type,
           department: appointmentForm.department.trim() || undefined,
           doctor_name: appointmentForm.doctor_name.trim() || undefined,
           appointment_date: appointmentForm.appointment_date,
-          status: "checked_in",
+          status: appointmentForm.doctor_name ? "checked_in" : "scheduled",
           notes: appointmentForm.notes.trim() || undefined,
+          chief_complaint: appointmentForm.chief_complaint.trim() || undefined,
+          symptoms: appointmentForm.symptoms.trim() || symptomsText.trim() || undefined,
+          symptom_duration: appointmentForm.symptom_duration.trim() || undefined,
+          symptom_severity: appointmentForm.symptom_severity || "moderate",
+          ai_recommendation: appointmentForm.ai_recommendation || (triageResult ? `${triageResult.urgency}: ${triageResult.reasoning}` : undefined),
+          gender_preference: appointmentForm.gender_preference || appointmentForm.patient_gender || undefined,
           consultation_fee: Number(appointmentForm.consultation_fee) || 0,
           payment_mode: appointmentForm.payment_mode,
         }),
       });
+      const token = data.token_no || data.op_number || 1;
+      const resolvedUmr = data.patient_id || appointmentForm.patient_id || "PAT-XXXXX";
+      
+      setRegisteredOpModalData({
+        patient_id: resolvedUmr,
+        token_no: token,
+        patient_name: patientName,
+        doctor_name: appointmentForm.doctor_name || "Assigned Specialist",
+        department: appointmentForm.department || "General",
+        consultation_fee: Number(appointmentForm.consultation_fee) || 0,
+      });
+
       setAppointmentForm((prev) => ({
         ...DEFAULT_APPOINTMENT_FORM,
-        patient_id: selectedPatient?.patient_id || "",
-        patient_name: patientName,
+        patient_id: "",
+        patient_name: "",
         department: prev.department,
         doctor_name: prev.doctor_name,
       }));
+      setSymptomsText("");
+      setTriageResult(null);
       await loadAppointments();
       await loadDoctorSuggestions();
       setNotice({
         type: "success",
-        message: `Appointment scheduled. Token #${data.token_no}. Redirecting to queue...`,
+        message: isOp
+          ? `🎉 OP Encounter registered! UMR: ${resolvedUmr} · OP Token #${token}`
+          : `Appointment scheduled. Token #${token}`,
       });
-      onNavigate?.("queue");
     } catch (error) {
       reportError(
         setNotice,
@@ -1153,43 +1295,142 @@ export default function RegistrationDeskPage({
       )}
 
       {mode === "appointment-in" ? (
-        <div className="panel registration-desk-panel">
-          <h4>Schedule Appointment</h4>
+        <div className="panel registration-desk-panel" style={{ borderRadius: "12px", border: "1px solid #e2e8f0", background: "#ffffff", padding: "1.5rem" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1.25rem", borderBottom: "1px solid #f1f5f9", paddingBottom: "0.75rem" }}>
+            <div>
+              <h3 style={{ fontSize: "1.25rem", fontWeight: 700, margin: 0, color: "#0f172a" }}>
+                {appointmentForm.visit_type === "OP" ? "Outpatient (OP) Desk & Token Generation" : "Inpatient (IP) Scheduling"}
+              </h3>
+              <p style={{ fontSize: "0.825rem", color: "#64748b", margin: "2px 0 0" }}>
+                {appointmentForm.visit_type === "OP"
+                  ? "Streamlined OP intake: 1 UMR · 1 OP Token · AI Triage · Gender Rule Doctor Assignment"
+                  : "Schedule Inpatient admission or follow-up"}
+              </p>
+            </div>
+            <div style={{ display: "flex", gap: "0.5rem" }}>
+              <span style={{
+                fontSize: "0.8rem",
+                padding: "0.25rem 0.75rem",
+                borderRadius: "999px",
+                fontWeight: 700,
+                background: appointmentForm.visit_type === "OP" ? "#ecfdf5" : "#eff6ff",
+                color: appointmentForm.visit_type === "OP" ? "#065f46" : "#1e40af",
+                border: `1px solid ${appointmentForm.visit_type === "OP" ? "#a7f3d0" : "#bfdbfe"}`,
+              }}>
+                {appointmentForm.visit_type} Workflow
+              </span>
+            </div>
+          </div>
+
+          {/* Selected / Looked up Patient Card */}
+          {loadedPatient ? (
+            <div style={{
+              background: "#f0fdf4",
+              border: "1px solid #86efac",
+              borderRadius: "10px",
+              padding: "0.85rem 1.2rem",
+              marginBottom: "1.25rem",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "1rem",
+              flexWrap: "wrap",
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "0.85rem" }}>
+                <div style={{
+                  width: "42px",
+                  height: "42px",
+                  borderRadius: "8px",
+                  background: loadedPatient.gender?.toLowerCase() === "female" ? "#fce7f3" : "#e0e7ff",
+                  color: loadedPatient.gender?.toLowerCase() === "female" ? "#9d174d" : "#3730a3",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontSize: "1rem",
+                  fontWeight: 700,
+                }}>
+                  {loadedPatient.gender?.toLowerCase() === "female" ? "F" : "M"}
+                </div>
+                <div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                    <strong style={{ fontSize: "1.05rem", color: "#0f172a" }}>{patientFullName(loadedPatient)}</strong>
+                    <span style={{ background: "#0284c7", color: "#ffffff", padding: "0.15rem 0.5rem", borderRadius: "4px", fontSize: "0.75rem", fontWeight: 700 }}>
+                      UMR: {loadedPatient.patient_id}
+                    </span>
+                    <span style={{ background: loadedPatient.gender?.toLowerCase() === "female" ? "#fdf2f8" : "#eff6ff", color: loadedPatient.gender?.toLowerCase() === "female" ? "#9d174d" : "#1e40af", fontWeight: 600, padding: "0.15rem 0.5rem", borderRadius: "4px", fontSize: "0.75rem", border: `1px solid ${loadedPatient.gender?.toLowerCase() === "female" ? "#fbcfe8" : "#bfdbfe"}` }}>
+                      {loadedPatient.gender || "Male"} {loadedPatient.age ? `· ${loadedPatient.age} yrs` : ""}
+                    </span>
+                  </div>
+                  <p style={{ margin: "0.2rem 0 0", fontSize: "0.8rem", color: "#475569" }}>
+                    Phone: {loadedPatient.phone || "N/A"} {loadedPatient.blood_group ? `· Blood Group: ${loadedPatient.blood_group}` : ""}
+                  </p>
+                </div>
+              </div>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setLoadedPatient(null);
+                  setAppointmentForm((prev) => ({ ...prev, patient_id: "", patient_name: "" }));
+                }}
+                style={{ color: "#0284c7" }}
+              >
+                Change Patient
+              </Button>
+            </div>
+          ) : (
+            <div className="grid-form" style={{ marginBottom: "1rem" }}>
+              <Label>
+                Patient ID / UMR
+                <PatientAutocomplete
+                  value={appointmentForm.patient_id}
+                  onChange={(val) =>
+                    setAppointmentForm((prev) => ({ ...prev, patient_id: val }))
+                  }
+                  onSelect={(patient) => {
+                    const fullName = patientFullName(patient);
+                    const gender = (patient.gender || "Male").trim();
+                    const cleanGender = gender.toLowerCase() === "female" ? "Female" : "Male";
+                    setLoadedPatient(patient);
+                    setAppointmentForm((prev) => ({
+                      ...prev,
+                      patient_id: patient.patient_id,
+                      patient_name: fullName,
+                      patient_gender: cleanGender,
+                    }));
+                    void loadEligibleDoctors(appointmentForm.department, cleanGender);
+                  }}
+                  placeholder="Search by UMR (e.g. PAT-100001)"
+                />
+              </Label>
+              <Label>
+                Patient Name
+                <PatientAutocomplete
+                  value={appointmentForm.patient_name}
+                  onChange={(val) =>
+                    setAppointmentForm((prev) => ({ ...prev, patient_name: val }))
+                  }
+                  onSelect={(patient) => {
+                    const fullName = patientFullName(patient);
+                    const gender = (patient.gender || "Male").trim();
+                    const cleanGender = gender.toLowerCase() === "female" ? "Female" : "Male";
+                    setLoadedPatient(patient);
+                    setAppointmentForm((prev) => ({
+                      ...prev,
+                      patient_id: patient.patient_id,
+                      patient_name: fullName,
+                      patient_gender: cleanGender,
+                    }));
+                    void loadEligibleDoctors(appointmentForm.department, cleanGender);
+                  }}
+                  placeholder="Search by Patient Name"
+                />
+              </Label>
+            </div>
+          )}
+
           <div className="grid-form">
-            <Label>
-              Patient ID
-              <PatientAutocomplete
-                value={appointmentForm.patient_id}
-                onChange={(val) =>
-                  setAppointmentForm((prev) => ({ ...prev, patient_id: val }))
-                }
-                onSelect={(patient) =>
-                  setAppointmentForm((prev) => ({
-                    ...prev,
-                    patient_id: patient.patient_id,
-                    patient_name: patientFullName(patient),
-                  }))
-                }
-                placeholder="Search by ID (last 4 digits)"
-              />
-            </Label>
-            <Label>
-              Patient Name
-              <PatientAutocomplete
-                value={appointmentForm.patient_name}
-                onChange={(val) =>
-                  setAppointmentForm((prev) => ({ ...prev, patient_name: val }))
-                }
-                onSelect={(patient) =>
-                  setAppointmentForm((prev) => ({
-                    ...prev,
-                    patient_id: patient.patient_id,
-                    patient_name: patientFullName(patient),
-                  }))
-                }
-                placeholder="Walk-in or existing patient"
-              />
-            </Label>
             <Label>
               Visit Type
               <Select
@@ -1201,68 +1442,12 @@ export default function RegistrationDeskPage({
                   }))
                 }
               >
-                <option value="OP">OP</option>
-                <option value="IP">IP</option>
-              </Select>
-            </Label>
-            <Label className="span-2">
-              Patient Symptoms (AI Triage)
-              <div
-                style={{ display: "flex", gap: "8px", flexDirection: "column" }}
-              >
-                <Textarea
-                  value={symptomsText}
-                  onChange={(e) => setSymptomsText(e.target.value)}
-                  placeholder="Describe patient symptoms here to auto-assign department..."
-                  rows={2}
-                />
-                <Button
-                  variant="secondary"
-                  type="button"
-                  onClick={() => void handleAITriage()}
-                  disabled={triageLoading}
-                >
-                  {triageLoading ? "Analyzing..." : "🪄 AI Triage"}
-                </Button>
-                {triageResult && (
-                  <div className="notice success">
-                    <strong>Urgency:</strong> {triageResult.urgency}
-                    <br />
-                    <strong>Reasoning:</strong> {triageResult.reasoning}
-                  </div>
-                )}
-              </div>
-            </Label>
-            <Label>
-              Department
-              <Select
-                value={appointmentForm.department}
-                onChange={(event) => handleDepartmentChange(event.target.value)}
-              >
-                <option value="">Select department</option>
-                {allDepartments.map((deptName) => (
-                  <option key={deptName} value={deptName}>
-                    {deptName}
-                  </option>
-                ))}
+                <option value="OP">OP (Outpatient Department)</option>
+                <option value="IP">IP (Inpatient Department)</option>
               </Select>
             </Label>
             <Label>
-              Doctor
-              <Input
-                value={appointmentForm.doctor_name}
-                onChange={(event) => handleDoctorChange(event.target.value)}
-                list="registration-doctors"
-                placeholder="Type doctor name (guest allowed)"
-              />
-              <datalist id="registration-doctors">
-                {doctorSuggestions.map((doctor) => (
-                  <option key={doctor} value={doctor} />
-                ))}
-              </datalist>
-            </Label>
-            <Label>
-              Appointment Time
+              Appointment Date & Time
               <Input
                 type="datetime-local"
                 value={appointmentForm.appointment_date}
@@ -1274,8 +1459,163 @@ export default function RegistrationDeskPage({
                 }
               />
             </Label>
+
+            {/* Dedicated Outpatient Details */}
+            {appointmentForm.visit_type === "OP" && (
+              <>
+                <Label>
+                  Chief Complaint
+                  <Input
+                    value={appointmentForm.chief_complaint}
+                    onChange={(e) => handleSymptomOrComplaintChange("chief_complaint", e.target.value)}
+                    placeholder="e.g. Chest pain, High fever, Knee ache"
+                  />
+                </Label>
+                <Label>
+                  Symptom Duration & Severity
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.5rem" }}>
+                    <Input
+                      value={appointmentForm.symptom_duration}
+                      onChange={(e) => setAppointmentForm((prev) => ({ ...prev, symptom_duration: e.target.value }))}
+                      placeholder="e.g. 3 days, 1 week"
+                    />
+                    <Select
+                      value={appointmentForm.symptom_severity}
+                      onChange={(e) => setAppointmentForm((prev) => ({ ...prev, symptom_severity: e.target.value }))}
+                    >
+                      <option value="mild">Mild</option>
+                      <option value="moderate">Moderate</option>
+                      <option value="severe">Severe / Urgent</option>
+                    </Select>
+                  </div>
+                </Label>
+
+                {/* AI Triage & Recommendation */}
+                <div style={{ gridColumn: "1 / -1", background: "#f8fafc", padding: "1rem", borderRadius: "8px", border: "1px solid #e2e8f0" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.5rem" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontWeight: 700, color: "#1e293b", fontSize: "0.9rem" }}>
+                      <FiCpu style={{ color: "#6366f1" }} />
+                      <span>AI Symptom Triage & Specialty Recommender</span>
+                    </div>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      type="button"
+                      onClick={() => void handleAITriage()}
+                      disabled={triageLoading}
+                      style={{ background: "#4f46e5", color: "#ffffff", border: "none" }}
+                    >
+                      {triageLoading ? "Analyzing Symptoms..." : "Run AI Triage"}
+                    </Button>
+                  </div>
+                  <Textarea
+                    value={symptomsText || appointmentForm.symptoms}
+                    onChange={(e) => {
+                      setSymptomsText(e.target.value);
+                      handleSymptomOrComplaintChange("symptoms", e.target.value);
+                    }}
+                    placeholder="Enter detailed patient symptoms for AI triage analysis..."
+                    rows={2}
+                  />
+                  {triageResult && (
+                    <div style={{ marginTop: "0.5rem", padding: "0.6rem 0.8rem", background: "#ecfdf5", borderRadius: "6px", border: "1px solid #a7f3d0", fontSize: "0.825rem", color: "#065f46" }}>
+                      <strong>AI Triage Result:</strong> Urgency: <span style={{ fontWeight: 700 }}>{triageResult.urgency}</span> · {triageResult.reasoning}
+                    </div>
+                  )}
+                </div>
+
+                {/* Gender Matching Doctor Engine Card */}
+                <div style={{ gridColumn: "1 / -1", background: "#faf5ff", padding: "1rem", borderRadius: "8px", border: "1px solid #e9d5ff" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.6rem" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontWeight: 700, color: "#6b21a8", fontSize: "0.9rem" }}>
+                      <FiZap style={{ color: "#9333ea" }} />
+                      <span>Gender-Matched Doctor Recommendation</span>
+                    </div>
+                    {recommendedDoctor && (
+                      <span style={{ fontSize: "0.75rem", background: "#f3e8ff", color: "#7e22ce", padding: "0.15rem 0.5rem", borderRadius: "999px", fontWeight: 600 }}>
+                        {recommendedDoctor.gender_matches ? `Gender Matched (${recommendedDoctor.gender})` : "Specialty Matched"} · Workload: {recommendedDoctor.current_workload} waiting
+                      </span>
+                    )}
+                  </div>
+
+                  {recommendedDoctor ? (
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "#ffffff", padding: "0.6rem 0.9rem", borderRadius: "6px", border: "1px solid #d8b4fe" }}>
+                      <div>
+                        <strong style={{ color: "#0f172a" }}>{recommendedDoctor.doctor_name}</strong>
+                        <span style={{ marginLeft: "0.5rem", color: "#64748b", fontSize: "0.825rem" }}>
+                          {recommendedDoctor.department} · {recommendedDoctor.gender} · ₹{recommendedDoctor.consultation_fee}
+                        </span>
+                        <span style={{ marginLeft: "0.5rem", fontSize: "0.75rem", padding: "0.1rem 0.4rem", borderRadius: "4px", fontWeight: 600, background: recommendedDoctor.is_available ? "#dcfce7" : "#fee2e2", color: recommendedDoctor.is_available ? "#166534" : "#991b1b" }}>
+                          {recommendedDoctor.is_available ? "Available" : recommendedDoctor.status}
+                        </span>
+                      </div>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => {
+                          setAppointmentForm((prev) => ({
+                            ...prev,
+                            doctor_name: recommendedDoctor.doctor_name,
+                            department: recommendedDoctor.department,
+                            consultation_fee: String(recommendedDoctor.consultation_fee),
+                          }));
+                        }}
+                      >
+                        Use Recommended
+                      </Button>
+                    </div>
+                  ) : (
+                    <p style={{ margin: 0, fontSize: "0.825rem", color: "#6b21a8" }}>
+                      Select a department above or run AI Triage to view matched doctors.
+                    </p>
+                  )}
+                </div>
+              </>
+            )}
+
             <Label>
-              Consultation Fee
+              Department
+              <Select
+                value={appointmentForm.department}
+                onChange={(event) => {
+                  handleDepartmentChange(event.target.value);
+                  if (appointmentForm.visit_type === "OP") {
+                    const pGen = loadedPatient?.gender || appointmentForm.patient_gender || "Male";
+                    void loadEligibleDoctors(event.target.value, pGen);
+                  }
+                }}
+              >
+                <option value="">Select department</option>
+                {allDepartments.map((deptName) => (
+                  <option key={deptName} value={deptName}>
+                    {deptName}
+                  </option>
+                ))}
+              </Select>
+            </Label>
+            <Label>
+              Assigned Doctor
+              <Input
+                value={appointmentForm.doctor_name}
+                onChange={(event) => handleDoctorChange(event.target.value)}
+                list="registration-doctors"
+                placeholder="Select or type doctor name"
+              />
+              <datalist id="registration-doctors">
+                {eligibleDoctors.length > 0
+                  ? eligibleDoctors.map((doc) => (
+                      <option key={doc.id} value={doc.doctor_name}>
+                        {doc.doctor_name} ({doc.department} - {doc.gender} - {doc.status})
+                      </option>
+                    ))
+                  : doctorSuggestions.map((doctor) => (
+                      <option key={doctor} value={doctor} />
+                    ))}
+              </datalist>
+            </Label>
+            <Label>
+              Consultation Fee (₹)
               <Input
                 type="number"
                 min={0}
@@ -1300,14 +1640,14 @@ export default function RegistrationDeskPage({
                   }))
                 }
               >
-                <option value="upi">UPI</option>
-                <option value="card">Card</option>
+                <option value="cash">Cash (OP Desk)</option>
+                <option value="upi">UPI (Instant)</option>
+                <option value="card">Card / POS</option>
                 <option value="bank">Bank Transfer</option>
-                <option value="cash">Cash</option>
               </Select>
             </Label>
             <Label className="span-2">
-              Notes
+              Registration Notes
               <Textarea
                 value={appointmentForm.notes}
                 onChange={(event) =>
@@ -1317,32 +1657,35 @@ export default function RegistrationDeskPage({
                   }))
                 }
                 rows={2}
+                placeholder="Optional notes for OP encounter..."
               />
             </Label>
           </div>
-          <div className="form-actions">
+
+          <div className="form-actions" style={{ marginTop: "1.25rem", display: "flex", gap: "0.75rem" }}>
             <Button
-              variant="secondary"
+              variant="primary"
               type="button"
               onClick={() => void handleCreateAppointment()}
               disabled={savingAppointment}
+              style={{ background: "#059669", padding: "0.6rem 1.25rem", fontSize: "0.9rem" }}
             >
-              {savingAppointment ? "Scheduling..." : "Schedule & Assign Token"}
+              {savingAppointment ? "Generating Token..." : "🚀 Register OP Encounter & Issue Token"}
             </Button>
             <Button
-              variant="primary"
+              variant="secondary"
               type="button"
               onClick={() => void handleCreateAppointmentWithRazorpay()}
               disabled={savingAppointment || !isRazorpayReady}
             >
               {savingAppointment
                 ? "Processing..."
-                : "Pay via Razorpay & Schedule"}
+                : "Pay via Razorpay & Issue Token"}
             </Button>
           </div>
           {!isRazorpayReady ? (
-            <p className="muted">
-              Razorpay payments are disabled until backend keys are configured.
+            <p className="muted" style={{ fontSize: "0.75rem", marginTop: "0.5rem" }}>
+              Razorpay payments are optional; cash & direct modes are active.
             </p>
           ) : null}
         </div>
@@ -1478,6 +1821,135 @@ export default function RegistrationDeskPage({
               ))}
             </div>
           )}
+        </div>
+      )}
+
+      {/* Registered OP Success Modal */}
+      {registeredOpModalData && (
+        <div style={{
+          position: "fixed",
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: "rgba(15, 23, 42, 0.65)",
+          backdropFilter: "blur(4px)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 9999,
+          padding: "1rem",
+        }}>
+          <div style={{
+            background: "#ffffff",
+            borderRadius: "16px",
+            boxShadow: "0 25px 50px -12px rgba(0, 0, 0, 0.25)",
+            maxWidth: "520px",
+            width: "100%",
+            padding: "2rem",
+            textAlign: "center",
+            border: "1px solid #e2e8f0",
+            animation: "fadeIn 0.2s ease-out",
+          }}>
+            <div style={{
+              width: "64px",
+              height: "64px",
+              background: "#dcfce7",
+              color: "#166534",
+              borderRadius: "50%",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: "2rem",
+              margin: "0 auto 1rem",
+            }}>
+              ✓
+            </div>
+            <h3 style={{ margin: "0 0 0.5rem", color: "#0f172a", fontSize: "1.35rem" }}>
+              OP Encounter Registered!
+            </h3>
+            <p style={{ margin: "0 0 1.5rem", color: "#64748b", fontSize: "0.9rem" }}>
+              Patient has been successfully enrolled and token assigned to the OP queue.
+            </p>
+
+            <div style={{
+              background: "#f8fafc",
+              border: "1px solid #e2e8f0",
+              borderRadius: "12px",
+              padding: "1.25rem",
+              marginBottom: "1.5rem",
+              textAlign: "left",
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              gap: "1rem",
+            }}>
+              <div>
+                <span style={{ fontSize: "0.75rem", color: "#64748b", textTransform: "uppercase", fontWeight: 700 }}>Permanent UMR</span>
+                <p style={{ margin: "0.2rem 0 0", fontSize: "1.1rem", fontWeight: 800, color: "#0284c7" }}>
+                  {registeredOpModalData.patient_id}
+                </p>
+              </div>
+              <div>
+                <span style={{ fontSize: "0.75rem", color: "#64748b", textTransform: "uppercase", fontWeight: 700 }}>OP Token #</span>
+                <p style={{ margin: "0.2rem 0 0", fontSize: "1.3rem", fontWeight: 900, color: "#16a34a" }}>
+                  #{registeredOpModalData.token_no}
+                </p>
+              </div>
+              <div style={{ gridColumn: "1 / -1", borderTop: "1px solid #f1f5f9", paddingTop: "0.75rem" }}>
+                <span style={{ fontSize: "0.75rem", color: "#64748b", textTransform: "uppercase", fontWeight: 700 }}>Patient Name</span>
+                <p style={{ margin: "0.2rem 0 0", fontSize: "1rem", fontWeight: 700, color: "#1e293b" }}>
+                  {registeredOpModalData.patient_name}
+                </p>
+              </div>
+              <div>
+                <span style={{ fontSize: "0.75rem", color: "#64748b", textTransform: "uppercase", fontWeight: 700 }}>Doctor Assigned</span>
+                <p style={{ margin: "0.2rem 0 0", fontSize: "0.9rem", fontWeight: 600, color: "#334155" }}>
+                  {registeredOpModalData.doctor_name}
+                </p>
+              </div>
+              <div>
+                <span style={{ fontSize: "0.75rem", color: "#64748b", textTransform: "uppercase", fontWeight: 700 }}>Department & Fee</span>
+                <p style={{ margin: "0.2rem 0 0", fontSize: "0.9rem", fontWeight: 600, color: "#334155" }}>
+                  {registeredOpModalData.department} (₹{registeredOpModalData.consultation_fee})
+                </p>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem" }}>
+              <Button
+                variant="primary"
+                type="button"
+                onClick={() => {
+                  setRegisteredOpModalData(null);
+                  onNavigate?.("op-desk");
+                }}
+                style={{ width: "100%", background: "#0284c7", padding: "0.75rem", fontSize: "0.95rem" }}
+              >
+                🚀 Open OP Command Center
+              </Button>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.6rem" }}>
+                <Button
+                  variant="secondary"
+                  type="button"
+                  onClick={() => {
+                    setRegisteredOpModalData(null);
+                    onNavigate?.("queue");
+                  }}
+                  style={{ padding: "0.6rem" }}
+                >
+                  🚶 Live Queue
+                </Button>
+                <Button
+                  variant="ghost"
+                  type="button"
+                  onClick={() => setRegisteredOpModalData(null)}
+                  style={{ padding: "0.6rem" }}
+                >
+                  + New Registration
+                </Button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </section>

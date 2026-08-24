@@ -57,7 +57,7 @@ ASSIGNABLE_MODULES = (
     "employees",  # Administration
     "patient_experience",  # Administration
 )
-DEFAULT_NORMAL_MODULES = ("dashboard", "patients", "symptom_ai")
+DEFAULT_NORMAL_MODULES = ("dashboard", "patients", "op", "symptom_ai")
 
 MODULE_BASE_PERMISSION = {
     "dashboard": "patients.read",

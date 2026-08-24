@@ -42,6 +42,26 @@ type DoctorForm = {
   status: string;
 };
 
+type Patient = {
+  patient_id: string;
+  name: string;
+  last_name: string;
+  phone?: string;
+  gender?: string;
+};
+
+type QueueEntry = {
+  id: number;
+  patient_id: string;
+  patient_name: string;
+  token_no: number;
+  doctor_name?: string;
+  department?: string;
+  status: string;
+  chief_complaint?: string;
+  symptoms?: string;
+};
+
 const EMPTY_SUMMARY: OpSummary = {
   date: "",
   total_appointments: 0,
@@ -76,20 +96,43 @@ export default function DoctorSchedulingPage({ setNotice, canEdit }: Props) {
   );
   const [selectedDoctor, setSelectedDoctor] = useState("");
   const [savingDepartment, setSavingDepartment] = useState(false);
+  const [patientQuery, setPatientQuery] = useState("");
+  const [patientSuggestions, setPatientSuggestions] = useState<Patient[]>([]);
+  const [selectedPatient, setSelectedPatient] = useState<Patient | null>(null);
+  const [newPatient, setNewPatient] = useState({ name: "", last_name: "", phone: "", gender: "", dob: "" });
+  const [opDetails, setOpDetails] = useState({ date: new Date().toLocaleDateString("en-CA"), department: "", chief_complaint: "", symptoms: "" });
+  const [registeringVisit, setRegisteringVisit] = useState(false);
+  const [queue, setQueue] = useState<QueueEntry[]>([]);
+
+  useEffect(() => {
+    const query = patientQuery.trim();
+    if (query.length < 2 || selectedPatient) {
+      setPatientSuggestions([]);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void apiFetch<{ patients?: Patient[] }>(`/api/patients?q=${encodeURIComponent(query)}`)
+        .then((data) => setPatientSuggestions(data.patients || []))
+        .catch(() => setPatientSuggestions([]));
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [patientQuery, selectedPatient]);
 
   const loadData = async () => {
     setLoading(true);
     try {
-      const [summaryData, deptData, doctorsData] = await Promise.all([
+      const [summaryData, deptData, doctorsData, queueData] = await Promise.all([
         apiFetch<OpSummary>(`/api/op/summary?date=${selectedDate}`),
         apiFetch<{ departments?: Department[] }>(
           "/api/registration/departments",
         ),
         apiFetch<{ doctors?: Doctor[] }>("/api/op/doctors"),
+        apiFetch<{ queue?: QueueEntry[] }>(`/api/queue?date=${selectedDate}`),
       ]);
       setSummary({ ...EMPTY_SUMMARY, ...summaryData });
       setDepartments(deptData.departments || []);
       setDoctors(doctorsData.doctors || []);
+      setQueue(queueData.queue || []);
     } catch (error) {
       reportError(
         setNotice,
@@ -205,6 +248,59 @@ export default function DoctorSchedulingPage({ setNotice, canEdit }: Props) {
     }
   };
 
+  const updateQueueStatus = async (entry: QueueEntry, status: string) => {
+    try {
+      await apiFetch(`/api/op/visits/${entry.id}/status`, {
+        method: "POST",
+        body: JSON.stringify({ status }),
+      });
+      setNotice({
+        type: "success",
+        message: `${entry.patient_name} moved to ${status.replace(/_/g, " ")}.`,
+      });
+      await loadData();
+    } catch (error) {
+      reportError(
+        setNotice,
+        error as { message?: string; status?: number },
+        "Unable to update OP status.",
+      );
+    }
+  };
+
+  const handleRegisterVisit = async () => {
+    if (!selectedPatient && (!newPatient.name.trim() || !newPatient.last_name.trim())) {
+      setNotice({ type: "error", message: "Select an existing patient or enter a new patient's first and last name." });
+      return;
+    }
+    if (!opDetails.chief_complaint.trim() && !opDetails.symptoms.trim()) {
+      setNotice({ type: "error", message: "Capture the patient's chief complaint or symptoms." });
+      return;
+    }
+    setRegisteringVisit(true);
+    try {
+      const result = await apiFetch<{ patient_id: string; op_number: number }>("/api/op/visits", {
+        method: "POST",
+        body: JSON.stringify({
+          patient_id: selectedPatient?.patient_id,
+          patient: selectedPatient ? undefined : newPatient,
+          appointment: { appointment_date: opDetails.date, department: opDetails.department, chief_complaint: opDetails.chief_complaint, symptoms: opDetails.symptoms },
+        }),
+      });
+      setNotice({ type: "success", message: `OP ${result.op_number} registered for UMR ${result.patient_id}.` });
+      setPatientQuery("");
+      setPatientSuggestions([]);
+      setSelectedPatient(null);
+      setNewPatient({ name: "", last_name: "", phone: "", gender: "", dob: "" });
+      setOpDetails((current) => ({ ...current, chief_complaint: "", symptoms: "" }));
+      await loadData();
+    } catch (error) {
+      reportError(setNotice, error as { message?: string; status?: number }, "Unable to register OP visit.");
+    } finally {
+      setRegisteringVisit(false);
+    }
+  };
+
   if (loading && !summary.total_appointments) {
     return <div className="page-loading">Loading scheduling data...</div>;
   }
@@ -240,6 +336,45 @@ export default function DoctorSchedulingPage({ setNotice, canEdit }: Props) {
         <StatCard label="FOLLOW-UPS" value={summary.follow_ups} />
         <StatCard label="ACTIVE QUEUE" value={summary.active_queue} />
         <StatCard label="NO-SHOWS" value={summary.no_shows} />
+      </div>
+
+      <div className="panel" style={{ marginTop: "1.5rem", padding: "1.25rem" }}>
+
+              <div className="panel" style={{ marginTop: "1.5rem" }}>
+                <div className="module-panel-head"><h4>Today&apos;s OP Queue</h4><span className="muted">{queue.length} active visits</span></div>
+                <Table>
+                  <TableHead><TableRow><TableCell>Token</TableCell><TableCell>Patient / UMR</TableCell><TableCell>Complaint</TableCell><TableCell>Doctor</TableCell><TableCell>Status</TableCell><TableCell>Action</TableCell></TableRow></TableHead>
+                  {queue.map((entry) => <TableRow key={entry.id}>
+                    <TableCell>OP{String(entry.token_no).padStart(3, "0")}</TableCell>
+                    <TableCell><strong>{entry.patient_name}</strong><br /><span className="muted">{entry.patient_id}</span></TableCell>
+                    <TableCell>{entry.chief_complaint || entry.symptoms || "Not captured"}</TableCell>
+                    <TableCell>{entry.doctor_name || "Awaiting assignment"}</TableCell>
+                    <TableCell>{entry.status.replace(/_/g, " ")}</TableCell>
+                    <TableCell>{entry.status === "scheduled" && <Button type="button" onClick={() => void updateQueueStatus(entry, "checked_in")}>Check in</Button>}{entry.status === "checked_in" && <Button type="button" onClick={() => void updateQueueStatus(entry, "in_consultation")}>Start</Button>}{entry.status === "in_consultation" && <Button type="button" onClick={() => void updateQueueStatus(entry, "completed")}>Complete</Button>}</TableCell>
+                  </TableRow>)}
+                </Table>
+                {!queue.length && <p className="muted">No active OP visits for this date.</p>}
+              </div>
+        <div className="module-panel-head" style={{ borderBottom: "none", padding: 0 }}>
+          <div>
+            <h4>OP Registration</h4>
+            <p className="muted">One patient keeps one UMR. Each visit receives a new OP number.</p>
+          </div>
+          {selectedPatient && <strong>UMR: {selectedPatient.patient_id}</strong>}
+        </div>
+        <div style={{ display: "grid", gap: "0.75rem", gridTemplateColumns: "repeat(4, minmax(0, 1fr))" }}>
+          <div style={{ gridColumn: "span 2", position: "relative" }}>
+            <label>Search existing patient</label>
+            <Input value={selectedPatient ? `${selectedPatient.name} ${selectedPatient.last_name}` : patientQuery} placeholder="Name, phone, or patient ID" onChange={(event) => { setSelectedPatient(null); setPatientQuery(event.target.value); }} />
+            {patientSuggestions.length > 0 && <div className="panel" style={{ position: "absolute", zIndex: 2, width: "100%", padding: "0.5rem" }}>{patientSuggestions.map((patient) => <button type="button" key={patient.patient_id} className="table-button" onClick={() => { setSelectedPatient(patient); setPatientQuery(""); setPatientSuggestions([]); }}>{patient.name} {patient.last_name} · {patient.patient_id} · {patient.phone || "no phone"}</button>)}</div>}
+          </div>
+          <Input type="date" value={opDetails.date} onChange={(event) => setOpDetails({ ...opDetails, date: event.target.value })} />
+          <Input placeholder="Department" value={opDetails.department} onChange={(event) => setOpDetails({ ...opDetails, department: event.target.value })} />
+          {!selectedPatient && <><Input placeholder="First name" value={newPatient.name} onChange={(event) => setNewPatient({ ...newPatient, name: event.target.value })} /><Input placeholder="Last name" value={newPatient.last_name} onChange={(event) => setNewPatient({ ...newPatient, last_name: event.target.value })} /><Input placeholder="Phone" value={newPatient.phone} onChange={(event) => setNewPatient({ ...newPatient, phone: event.target.value })} /></>}
+          <Input placeholder="Chief complaint" value={opDetails.chief_complaint} onChange={(event) => setOpDetails({ ...opDetails, chief_complaint: event.target.value })} />
+          <Input placeholder="Symptoms and duration" value={opDetails.symptoms} onChange={(event) => setOpDetails({ ...opDetails, symptoms: event.target.value })} />
+        </div>
+        <Button type="button" disabled={registeringVisit} onClick={() => void handleRegisterVisit()}>{registeringVisit ? "Registering..." : "Register OP Visit"}</Button>
       </div>
 
       <div

@@ -9,16 +9,35 @@ import {
   TableCell,
   TableHead,
   TableRow,
+  Textarea,
 } from "../components/ui";
 import { apiFetch, reportError } from "../lib/api";
 import { formatDateTime } from "../lib/format";
 import { openRazorpayCheckout } from "../lib/razorpay";
-import type { Appointment, DoctorSchedule, Notice, OpSummary } from "../types";
+import type { Appointment, DoctorSchedule, Notice, OpSummary, OpTimelineEvent, EligibleDoctor } from "../types";
 import PrescriptionUploadModal from "../components/PrescriptionUploadModal";
+import {
+  FiActivity,
+  FiClock,
+  FiUserCheck,
+  FiCalendar,
+  FiCheckCircle,
+  FiAlertCircle,
+  FiUsers,
+  FiCpu,
+  FiPlus,
+  FiSearch,
+  FiArrowRight,
+  FiEye,
+  FiHeart,
+  FiFileText,
+  FiRefreshCw,
+} from "react-icons/fi";
 
 type Props = {
   setNotice: Dispatch<SetStateAction<Notice | null>>;
   canEdit: boolean;
+  onNavigate?: (page: string, extraData?: any) => void;
 };
 
 type Department = {
@@ -52,16 +71,29 @@ type AppointmentForm = {
   consultation_fee: string;
   payment_mode: string;
   notes: string;
+  chief_complaint?: string;
+  symptoms?: string;
+  symptom_duration?: string;
+  symptom_severity?: string;
+  gender_preference?: string;
 };
 
 const EMPTY_SUMMARY: OpSummary = {
   date: "",
   total_appointments: 0,
+  new_patients: 0,
   follow_ups: 0,
+  awaiting_doctor: 0,
   active_queue: 0,
+  in_consultation: 0,
+  completed: 0,
   no_shows: 0,
   reminders_sent: 0,
   available_doctors: 0,
+  busy_doctors: 0,
+  leave_doctors: 0,
+  pending_billing: 0,
+  pending_investigations: 0,
 };
 
 const DEFAULT_SCHEDULE_FORM: ScheduleForm = {
@@ -88,8 +120,13 @@ const DEFAULT_APPOINTMENT_FORM: AppointmentForm = {
   appointment_kind: "new",
   follow_up_for: "",
   consultation_fee: "0",
-  payment_mode: "upi",
+  payment_mode: "cash",
   notes: "",
+  chief_complaint: "",
+  symptoms: "",
+  symptom_duration: "",
+  symptom_severity: "moderate",
+  gender_preference: "",
 };
 
 function toDateTimeLocalValue(value?: string | null) {
@@ -100,67 +137,59 @@ function toDateTimeLocalValue(value?: string | null) {
   return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())}T${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
 }
 
-export default function OpPage({ setNotice, canEdit }: Props) {
+export default function OpPage({ setNotice, canEdit, onNavigate }: Props) {
+  const [activeTab, setActiveTab] = useState<"overview" | "queue" | "encounters" | "doctors">("overview");
   const [summary, setSummary] = useState<OpSummary>(EMPTY_SUMMARY);
   const [schedules, setSchedules] = useState<DoctorSchedule[]>([]);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
+  const [allDoctors, setAllDoctors] = useState<EligibleDoctor[]>([]);
   const [loading, setLoading] = useState(true);
-  const [scheduleForm, setScheduleForm] = useState<ScheduleForm>(
-    DEFAULT_SCHEDULE_FORM,
-  );
-  const [appointmentForm, setAppointmentForm] = useState<AppointmentForm>(
-    DEFAULT_APPOINTMENT_FORM,
-  );
+  const [searchTerm, setSearchTerm] = useState("");
+
+  const [scheduleForm, setScheduleForm] = useState<ScheduleForm>(DEFAULT_SCHEDULE_FORM);
+  const [appointmentForm, setAppointmentForm] = useState<AppointmentForm>(DEFAULT_APPOINTMENT_FORM);
   const [savingSchedule, setSavingSchedule] = useState(false);
   const [savingAppointment, setSavingAppointment] = useState(false);
   const [isRazorpayReady, setIsRazorpayReady] = useState(true);
-  const [selectedDate, setSelectedDate] = useState(
-    new Date().toLocaleDateString("en-CA"),
-  );
+  const [selectedDate, setSelectedDate] = useState(new Date().toLocaleDateString("en-CA"));
   const [selectedDoctor, setSelectedDoctor] = useState("");
-  const [uploadPrescriptionPatient, setUploadPrescriptionPatient] = useState<{
-    id: string;
-    name: string;
-  } | null>(null);
 
-  const loadOpDesk = async (
-    date = selectedDate,
-    doctorName = selectedDoctor,
-  ) => {
+  // Modals state
+  const [uploadPrescriptionPatient, setUploadPrescriptionPatient] = useState<{ id: string; name: string } | null>(null);
+  const [timelineAppointment, setTimelineAppointment] = useState<Appointment | null>(null);
+  const [timelineEvents, setTimelineEvents] = useState<OpTimelineEvent[]>([]);
+  const [loadingTimeline, setLoadingTimeline] = useState(false);
+
+  const [vitalsAppointment, setVitalsAppointment] = useState<Appointment | null>(null);
+  const [vitalsForm, setVitalsForm] = useState({
+    bp: "",
+    pulse: "",
+    temperature: "",
+    spo2: "",
+    respiratory_rate: "",
+    weight: "",
+    blood_glucose: "",
+    notes: "",
+  });
+  const [savingVitals, setSavingVitals] = useState(false);
+
+  const loadOpDesk = async (date = selectedDate, doctorName = selectedDoctor) => {
     setLoading(true);
     try {
-      const doctorQuery = doctorName
-        ? `&doctor_name=${encodeURIComponent(doctorName)}`
-        : "";
-      const [summaryData, scheduleData, appointmentData] = await Promise.all([
+      const doctorQuery = doctorName ? `&doctor_name=${encodeURIComponent(doctorName)}` : "";
+      const [summaryData, scheduleData, appointmentData, doctorsData] = await Promise.all([
         apiFetch<OpSummary>(`/api/op/summary?date=${date}`),
-        apiFetch<{ schedules?: DoctorSchedule[] }>(
-          `/api/op/doctor-schedules?date=${date}${doctorQuery}`,
-        ),
-        apiFetch<{ appointments?: Appointment[] }>(
-          `/api/appointments?date=${date}&visit_type=OP${doctorQuery}`,
-        ),
+        apiFetch<{ schedules?: DoctorSchedule[] }>(`/api/op/doctor-schedules?date=${date}${doctorQuery}`),
+        apiFetch<{ appointments?: Appointment[] }>(`/api/appointments?date=${date}&visit_type=OP${doctorQuery}`),
+        apiFetch<{ doctors?: EligibleDoctor[] }>(`/api/op/doctors/eligible`),
       ]);
-      const nextSchedules = scheduleData.schedules || [];
-      const nextAppointments = appointmentData.appointments || [];
       setSummary({ ...EMPTY_SUMMARY, ...summaryData });
-      setSchedules(nextSchedules);
-      setAppointments(nextAppointments);
-      setAppointmentForm((current) => {
-        if (current.doctor_name || !nextSchedules[0]) return current;
-        return {
-          ...current,
-          doctor_name: nextSchedules[0].doctor_name,
-          department: nextSchedules[0].department || current.department,
-        };
-      });
+      setSchedules(scheduleData.schedules || []);
+      setAppointments(appointmentData.appointments || []);
+      setAllDoctors(doctorsData.doctors || []);
     } catch (error) {
-      reportError(
-        setNotice,
-        error as { message?: string; status?: number },
-        "Unable to load OP desk.",
-      );
+      reportError(setNotice, error as { message?: string; status?: number }, "Unable to load OP desk.");
     } finally {
       setLoading(false);
     }
@@ -182,880 +211,456 @@ export default function OpPage({ setNotice, canEdit }: Props) {
       .catch(() => setIsRazorpayReady(true));
   }, []);
 
-  const ensureRazorpayConfigured = async () => {
-    try {
-      const config = await apiFetch<{ configured?: boolean }>(
-        "/api/payments/razorpay/config",
-      );
-      const configured = config.configured !== false;
-      setIsRazorpayReady(configured);
-      if (!configured) {
-        setNotice({
-          type: "error",
-          message: "Razorpay is not configured. Add keys in backend .env.",
-        });
-        return false;
-      }
-      return true;
-    } catch {
-      return true;
-    }
-  };
-
   const doctorNames = useMemo(() => {
     const names = new Set<string>();
     schedules.forEach((item) => names.add(item.doctor_name));
     appointments.forEach((item) => {
       if (item.doctor_name) names.add(item.doctor_name);
     });
+    allDoctors.forEach((d) => names.add(d.doctor_name));
     return Array.from(names).sort((a, b) => a.localeCompare(b));
-  }, [schedules, appointments]);
+  }, [schedules, appointments, allDoctors]);
 
-  const handleScheduleSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (
-      !scheduleForm.doctor_name.trim() ||
-      !scheduleForm.schedule_date ||
-      !scheduleForm.start_time ||
-      !scheduleForm.end_time
-    ) {
-      setNotice({
-        type: "error",
-        message: "Doctor, date, and time range are required.",
-      });
-      return;
-    }
-    setSavingSchedule(true);
+  const handleOpenTimeline = async (appointment: Appointment) => {
+    setTimelineAppointment(appointment);
+    setLoadingTimeline(true);
     try {
-      const scheduleId = Number(scheduleForm.id);
-      const path = scheduleId
-        ? `/api/op/doctor-schedules/${scheduleId}`
-        : "/api/op/doctor-schedules";
-      await apiFetch(path, {
-        method: scheduleId ? "PUT" : "POST",
-        body: JSON.stringify({
-          doctor_name: scheduleForm.doctor_name.trim(),
-          department: scheduleForm.department.trim() || undefined,
-          schedule_date: scheduleForm.schedule_date,
-          start_time: scheduleForm.start_time,
-          end_time: scheduleForm.end_time,
-          slot_capacity: Number(scheduleForm.slot_capacity) || 12,
-          status: scheduleForm.status,
-          notes: scheduleForm.notes.trim() || undefined,
-        }),
-      });
-      setScheduleForm({
-        ...DEFAULT_SCHEDULE_FORM,
-        schedule_date: selectedDate,
-      });
-      setNotice({
-        type: "success",
-        message: scheduleId
-          ? "Doctor schedule updated."
-          : "Doctor schedule added.",
-      });
-      await loadOpDesk(selectedDate, selectedDoctor);
-    } catch (error) {
-      reportError(
-        setNotice,
-        error as { message?: string; status?: number },
-        "Unable to save doctor schedule.",
-      );
+      const res = await apiFetch<{ timeline: OpTimelineEvent[] }>(`/api/op/visits/${appointment.id}/timeline`);
+      setTimelineEvents(res.timeline || []);
+    } catch {
+      setTimelineEvents([]);
     } finally {
-      setSavingSchedule(false);
+      setLoadingTimeline(false);
     }
   };
 
-  const handleAppointmentSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (
-      !appointmentForm.patient_name.trim() ||
-      !appointmentForm.appointment_date
-    ) {
-      setNotice({
-        type: "error",
-        message: "Patient name and appointment date are required.",
-      });
-      return;
-    }
-    setSavingAppointment(true);
-    try {
-      const appointmentId = Number(appointmentForm.id);
-      const path = appointmentId
-        ? `/api/appointments/${appointmentId}`
-        : "/api/appointments";
-      const appointmentPayload = {
-        patient_id: appointmentForm.patient_id.trim() || undefined,
-        patient_name: appointmentForm.patient_name.trim(),
-        visit_type: "OP",
-        department: appointmentForm.department.trim() || undefined,
-        doctor_name: appointmentForm.doctor_name.trim() || undefined,
-        appointment_date: appointmentForm.appointment_date,
-        status: appointmentForm.status,
-        appointment_kind: appointmentForm.appointment_kind,
-        follow_up_for:
-          appointmentForm.appointment_kind === "follow_up" &&
-          appointmentForm.follow_up_for
-            ? Number(appointmentForm.follow_up_for)
-            : undefined,
-        notes: appointmentForm.notes.trim() || undefined,
-        consultation_fee: Number(appointmentForm.consultation_fee) || 0,
-        payment_mode: appointmentForm.payment_mode,
-      };
-      await apiFetch(path, {
-        method: appointmentId ? "PUT" : "POST",
-        body: JSON.stringify(appointmentPayload),
-      });
-      setAppointmentForm({
-        ...DEFAULT_APPOINTMENT_FORM,
-        appointment_date: `${selectedDate}T09:00`,
-        doctor_name: appointmentForm.doctor_name,
-        department: appointmentForm.department,
-      });
-      setNotice({
-        type: "success",
-        message: appointmentId
-          ? "Appointment updated."
-          : "Appointment scheduled.",
-      });
-      await loadOpDesk(selectedDate, selectedDoctor);
-    } catch (error) {
-      reportError(
-        setNotice,
-        error as { message?: string; status?: number },
-        "Unable to save appointment.",
-      );
-    } finally {
-      setSavingAppointment(false);
-    }
+  const handleOpenVitals = (appointment: Appointment) => {
+    setVitalsAppointment(appointment);
+    setVitalsForm({
+      bp: "",
+      pulse: "",
+      temperature: "",
+      spo2: "",
+      respiratory_rate: "",
+      weight: "",
+      blood_glucose: "",
+      notes: "",
+    });
   };
 
-  const handleRazorpayAppointmentSubmit = async () => {
-    if (!(await ensureRazorpayConfigured())) {
-      return;
-    }
-    if (
-      !appointmentForm.patient_name.trim() ||
-      !appointmentForm.appointment_date
-    ) {
-      setNotice({
-        type: "error",
-        message: "Patient name and appointment date are required.",
-      });
-      return;
-    }
-    const consultationFee = Number(appointmentForm.consultation_fee) || 0;
-    if (consultationFee <= 0) {
-      setNotice({
-        type: "error",
-        message:
-          "Consultation fee must be greater than zero for Razorpay payment.",
-      });
-      return;
-    }
-    setSavingAppointment(true);
+  const handleSaveVitals = async () => {
+    if (!vitalsAppointment) return;
+    setSavingVitals(true);
     try {
-      const appointmentPayload = {
-        patient_id: appointmentForm.patient_id.trim() || undefined,
-        patient_name: appointmentForm.patient_name.trim(),
-        visit_type: "OP",
-        department: appointmentForm.department.trim() || undefined,
-        doctor_name: appointmentForm.doctor_name.trim() || undefined,
-        appointment_date: appointmentForm.appointment_date,
-        status: appointmentForm.status,
-        appointment_kind: appointmentForm.appointment_kind,
-        follow_up_for:
-          appointmentForm.appointment_kind === "follow_up" &&
-          appointmentForm.follow_up_for
-            ? Number(appointmentForm.follow_up_for)
-            : undefined,
-        notes: appointmentForm.notes.trim() || undefined,
-      };
-
-      const order = await apiFetch<{
-        key_id: string;
-        order_id: string;
-        amount: number;
-        currency: string;
-      }>("/api/appointments/razorpay/order", {
+      await apiFetch(`/api/op/visits/${vitalsAppointment.id}/vitals`, {
         method: "POST",
-        body: JSON.stringify({
-          amount: consultationFee,
-          notes: {
-            patient_name: appointmentPayload.patient_name,
-            doctor_name: appointmentPayload.doctor_name || "",
-            appointment_date: appointmentPayload.appointment_date,
-          },
-        }),
+        body: JSON.stringify(vitalsForm),
       });
-
-      const paymentResult = await openRazorpayCheckout({
-        key: order.key_id,
-        amount: order.amount,
-        currency: order.currency || "INR",
-        name: "HospAI OP Desk",
-        description: "OP Appointment Booking",
-        order_id: order.order_id,
-        prefill: {
-          name: appointmentPayload.patient_name,
-        },
-        notes: {
-          patient_id: appointmentPayload.patient_id || "",
-        },
-        theme: {
-          color: "#0f766e",
-        },
-      });
-
-      await apiFetch("/api/appointments/razorpay/verify", {
-        method: "POST",
-        body: JSON.stringify({
-          amount: consultationFee,
-          payment_mode: appointmentForm.payment_mode,
-          appointment: appointmentPayload,
-          razorpay_order_id: paymentResult.razorpay_order_id,
-          razorpay_payment_id: paymentResult.razorpay_payment_id,
-          razorpay_signature: paymentResult.razorpay_signature,
-        }),
-      });
-
-      setAppointmentForm({
-        ...DEFAULT_APPOINTMENT_FORM,
-        appointment_date: `${selectedDate}T09:00`,
-        doctor_name: appointmentForm.doctor_name,
-        department: appointmentForm.department,
-      });
-      setNotice({
-        type: "success",
-        message: "Appointment scheduled and paid via Razorpay.",
-      });
-      await loadOpDesk(selectedDate, selectedDoctor);
+      setNotice({ type: "success", message: `Vitals recorded for OP #${vitalsAppointment.token_no} (${vitalsAppointment.patient_name})` });
+      setVitalsAppointment(null);
+      await loadOpDesk();
     } catch (error) {
-      reportError(
-        setNotice,
-        error as { message?: string; status?: number },
-        "Unable to complete Razorpay appointment payment.",
-      );
+      reportError(setNotice, error as { message?: string }, "Unable to save vitals.");
     } finally {
-      setSavingAppointment(false);
+      setSavingVitals(false);
     }
   };
 
-  const quickUpdateAppointment = async (
-    appointment: Appointment,
-    status: string,
-  ) => {
+  const quickUpdateStatus = async (appointment: Appointment, nextStatus: string) => {
     try {
-      await apiFetch(`/api/appointments/${appointment.id}`, {
-        method: "PUT",
-        body: JSON.stringify({ status }),
+      await apiFetch(`/api/op/visits/${appointment.id}/status`, {
+        method: "POST",
+        body: JSON.stringify({ status: nextStatus }),
       });
       setNotice({
         type: "success",
-        message: `Appointment marked ${status.replace("_", " ")}.`,
+        message: `OP #${appointment.token_no} transitioned to ${nextStatus.replace("_", " ")}.`,
       });
-      await loadOpDesk(selectedDate, selectedDoctor);
+      await loadOpDesk();
     } catch (error) {
-      reportError(
-        setNotice,
-        error as { message?: string; status?: number },
-        "Unable to update appointment status.",
-      );
+      reportError(setNotice, error as { message?: string }, "Status update failed.");
     }
   };
 
-  const markReminderSent = async (appointment: Appointment) => {
+  const handleReassignDoctor = async (appointmentId: number, doctorName: string) => {
     try {
-      await apiFetch(`/api/appointments/${appointment.id}`, {
-        method: "PUT",
-        body: JSON.stringify({ reminder_sent_at: new Date().toISOString() }),
+      await apiFetch(`/api/op/visits/${appointmentId}/assign`, {
+        method: "POST",
+        body: JSON.stringify({ doctor_name: doctorName }),
       });
-      setNotice({ type: "success", message: "Reminder marked as sent." });
-      await loadOpDesk(selectedDate, selectedDoctor);
+      setNotice({ type: "success", message: `Assigned to ${doctorName}.` });
+      await loadOpDesk();
     } catch (error) {
-      reportError(
-        setNotice,
-        error as { message?: string; status?: number },
-        "Unable to update reminder status.",
-      );
+      reportError(setNotice, error as { message?: string }, "Doctor reassignment failed.");
     }
   };
 
-  const markNoShow = async (appointment: Appointment) => {
-    try {
-      await apiFetch(`/api/appointments/${appointment.id}`, {
-        method: "PUT",
-        body: JSON.stringify({ no_show_marked: true, status: "cancelled" }),
-      });
-      setNotice({ type: "success", message: "Appointment marked as no-show." });
-      await loadOpDesk(selectedDate, selectedDoctor);
-    } catch (error) {
-      reportError(
-        setNotice,
-        error as { message?: string; status?: number },
-        "Unable to mark no-show.",
-      );
-    }
-  };
+  const filteredAppointments = useMemo(() => {
+    if (!searchTerm.trim()) return appointments;
+    const term = searchTerm.toLowerCase();
+    return appointments.filter(
+      (a) =>
+        a.patient_name.toLowerCase().includes(term) ||
+        (a.patient_id || "").toLowerCase().includes(term) ||
+        (a.doctor_name || "").toLowerCase().includes(term) ||
+        (a.chief_complaint || "").toLowerCase().includes(term) ||
+        String(a.token_no).includes(term)
+    );
+  }, [appointments, searchTerm]);
 
-  const deleteSchedule = async (schedule: DoctorSchedule) => {
-    if (!window.confirm(`Delete ${schedule.doctor_name} schedule?`)) return;
-    try {
-      await apiFetch(`/api/op/doctor-schedules/${schedule.id}`, {
-        method: "DELETE",
-      });
-      setNotice({ type: "success", message: "Doctor schedule deleted." });
-      await loadOpDesk(selectedDate, selectedDoctor);
-    } catch (error) {
-      reportError(
-        setNotice,
-        error as { message?: string; status?: number },
-        "Unable to delete doctor schedule.",
-      );
-    }
-  };
+  const queueList = useMemo(() => {
+    return filteredAppointments.filter((a) => a.status !== "completed" && a.status !== "cancelled");
+  }, [filteredAppointments]);
 
   return (
-    <section className="module-page">
-      <div className="module-panel-head">
-        <h3>OP Desk</h3>
-        <div className="module-inline-actions">
+    <section className="module-page" style={{ maxWidth: "1250px", margin: "0 auto" }}>
+      {/* Header & Date/Doctor Quick Controls */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1.25rem", flexWrap: "wrap", gap: "1rem" }}>
+        <div>
+          <h2 style={{ fontSize: "1.35rem", fontWeight: 800, margin: 0, color: "#0f172a", display: "flex", alignItems: "center", gap: "0.5rem" }}>
+            <FiActivity style={{ color: "#059669" }} />
+            Outpatient (OP) Command Center
+          </h2>
+          <p style={{ fontSize: "0.825rem", color: "#64748b", margin: "2px 0 0" }}>
+            Real-time OP queue orchestration, doctor workload, patient encounters & vital tracking
+          </p>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
           <Input
             type="date"
             value={selectedDate}
-            onChange={(event) => setSelectedDate(event.target.value)}
-            aria-label="OP date"
+            onChange={(e) => setSelectedDate(e.target.value)}
+            style={{ width: "150px", fontSize: "0.85rem" }}
           />
           <Select
             value={selectedDoctor}
-            onChange={(event) => setSelectedDoctor(event.target.value)}
-            aria-label="OP doctor filter"
+            onChange={(e) => setSelectedDoctor(e.target.value)}
+            style={{ width: "170px", fontSize: "0.85rem" }}
           >
-            <option value="">All doctors</option>
-            {doctorNames.map((name) => (
-              <option key={name} value={name}>
-                {name}
+            <option value="">All Doctors</option>
+            {doctorNames.map((d) => (
+              <option key={d} value={d}>
+                {d}
               </option>
             ))}
           </Select>
+          <Button variant="secondary" size="sm" onClick={() => void loadOpDesk()}>
+            <FiRefreshCw />
+          </Button>
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => onNavigate?.("appointment-in")}
+            style={{ background: "#059669" }}
+          >
+            <FiPlus style={{ marginRight: "4px" }} /> New OP Visit
+          </Button>
         </div>
       </div>
 
-      <div className="stat-grid module-stat-grid">
-        <StatCard label="OP Appointments" value={summary.total_appointments} />
-        <StatCard label="Follow-ups" value={summary.follow_ups} />
-        <StatCard label="Active Queue" value={summary.active_queue} />
-        <StatCard label="No-Shows" value={summary.no_shows} />
-        <StatCard label="Reminders Sent" value={summary.reminders_sent} />
-        <StatCard label="Doctors Available" value={summary.available_doctors} />
+      {/* Modern Tab Bar */}
+      <div style={{ display: "flex", gap: "0.5rem", borderBottom: "1px solid #e2e8f0", marginBottom: "1.25rem", paddingBottom: "0.5rem" }}>
+        <button
+          type="button"
+          onClick={() => setActiveTab("overview")}
+          style={{
+            padding: "0.5rem 1rem",
+            fontSize: "0.875rem",
+            fontWeight: 600,
+            borderRadius: "6px",
+            border: "none",
+            cursor: "pointer",
+            background: activeTab === "overview" ? "#059669" : "transparent",
+            color: activeTab === "overview" ? "#ffffff" : "#475569",
+            transition: "all 0.15s ease",
+          }}
+        >
+          📊 Dashboard & KPIs
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab("queue")}
+          style={{
+            padding: "0.5rem 1rem",
+            fontSize: "0.875rem",
+            fontWeight: 600,
+            borderRadius: "6px",
+            border: "none",
+            cursor: "pointer",
+            background: activeTab === "queue" ? "#059669" : "transparent",
+            color: activeTab === "queue" ? "#ffffff" : "#475569",
+            position: "relative",
+          }}
+        >
+          🚶 Live OP Queue ({queueList.length})
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab("encounters")}
+          style={{
+            padding: "0.5rem 1rem",
+            fontSize: "0.875rem",
+            fontWeight: 600,
+            borderRadius: "6px",
+            border: "none",
+            cursor: "pointer",
+            background: activeTab === "encounters" ? "#059669" : "transparent",
+            color: activeTab === "encounters" ? "#ffffff" : "#475569",
+          }}
+        >
+          📋 OP Encounters & Timeline
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab("doctors")}
+          style={{
+            padding: "0.5rem 1rem",
+            fontSize: "0.875rem",
+            fontWeight: 600,
+            borderRadius: "6px",
+            border: "none",
+            cursor: "pointer",
+            background: activeTab === "doctors" ? "#059669" : "transparent",
+            color: activeTab === "doctors" ? "#ffffff" : "#475569",
+          }}
+        >
+          🩺 Doctor Directory ({allDoctors.length})
+        </button>
       </div>
 
-      {loading ? <p className="muted">Loading OP workflow...</p> : null}
-
-      <div className="split">
-        <div className="panel">
-          <div className="module-panel-head">
-            <h3>Doctor Schedule</h3>
+      {/* TAB 1: OVERVIEW & KPIS */}
+      {activeTab === "overview" && (
+        <div style={{ display: "grid", gap: "1.25rem" }}>
+          {/* Stat Cards Grid */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: "0.85rem" }}>
+            <StatCard label="Total OP Visits Today" value={summary.total_appointments} />
+            <StatCard label="New Patients (UMR)" value={summary.new_patients ?? 0} />
+            <StatCard label="Revisits / Follow-ups" value={summary.follow_ups} />
+            <StatCard label="Active Queue (Waiting)" value={summary.active_queue} />
+            <StatCard label="In Consultation" value={summary.in_consultation ?? 0} />
+            <StatCard label="Completed Visits" value={summary.completed ?? 0} />
+            <StatCard label="Available Doctors" value={summary.available_doctors} />
           </div>
-          <form
-            className="module-form-grid module-sales-grid"
-            onSubmit={handleScheduleSubmit}
-          >
-            <Input
-              value={scheduleForm.doctor_name}
-              onChange={(event) =>
-                setScheduleForm((current) => ({
-                  ...current,
-                  doctor_name: event.target.value,
-                }))
-              }
-              placeholder="Doctor name"
-              aria-label="Doctor name"
-              disabled={!canEdit}
-              list="op-doctor-suggestions"
-            />
-            <Select
-              value={scheduleForm.department}
-              onChange={(event) =>
-                setScheduleForm((current) => ({
-                  ...current,
-                  department: event.target.value,
-                }))
-              }
-              aria-label="Doctor department"
-              disabled={!canEdit}
-            >
-              <option value="">Select department</option>
-              {departments.map((department) => {
-                const name = (department.department_name || "").trim();
-                if (!name) return null;
-                return (
-                  <option key={department.id} value={name}>
-                    {name}
-                  </option>
-                );
-              })}
-            </Select>
-            <Input
-              type="date"
-              value={scheduleForm.schedule_date}
-              onChange={(event) =>
-                setScheduleForm((current) => ({
-                  ...current,
-                  schedule_date: event.target.value,
-                }))
-              }
-              aria-label="Schedule date"
-              disabled={!canEdit}
-            />
-            <Input
-              type="time"
-              value={scheduleForm.start_time}
-              onChange={(event) =>
-                setScheduleForm((current) => ({
-                  ...current,
-                  start_time: event.target.value,
-                }))
-              }
-              aria-label="Start time"
-              disabled={!canEdit}
-            />
-            <Input
-              type="time"
-              value={scheduleForm.end_time}
-              onChange={(event) =>
-                setScheduleForm((current) => ({
-                  ...current,
-                  end_time: event.target.value,
-                }))
-              }
-              aria-label="End time"
-              disabled={!canEdit}
-            />
-            <Input
-              type="number"
-              min={1}
-              value={scheduleForm.slot_capacity}
-              onChange={(event) =>
-                setScheduleForm((current) => ({
-                  ...current,
-                  slot_capacity: event.target.value,
-                }))
-              }
-              placeholder="Slot capacity"
-              aria-label="Slot capacity"
-              disabled={!canEdit}
-            />
-            <Select
-              value={scheduleForm.status}
-              onChange={(event) =>
-                setScheduleForm((current) => ({
-                  ...current,
-                  status: event.target.value,
-                }))
-              }
-              aria-label="Schedule status"
-              disabled={!canEdit}
-            >
-              <option value="available">Available</option>
-              <option value="full">Full</option>
-              <option value="leave">Leave</option>
-            </Select>
-            <Button
-              type="submit"
-              variant="primary"
-              disabled={!canEdit || savingSchedule}
-            >
-              {savingSchedule
-                ? "Saving..."
-                : scheduleForm.id
-                  ? "Update"
-                  : "Add"}
-            </Button>
-          </form>
 
-          {schedules.length === 0 ? (
-            <p className="muted">No doctor schedules for this day.</p>
-          ) : (
-            <Table className="module-table" aria-label="Doctor schedules table">
-              <TableHead>
-                <TableCell>Doctor</TableCell>
-                <TableCell>Department</TableCell>
-                <TableCell>Time</TableCell>
-                <TableCell>Capacity</TableCell>
-                <TableCell>Status</TableCell>
-                <TableCell>Actions</TableCell>
-              </TableHead>
-              {schedules.map((schedule) => (
-                <TableRow key={schedule.id}>
-                  <TableCell>{schedule.doctor_name}</TableCell>
-                  <TableCell>{schedule.department || "-"}</TableCell>
-                  <TableCell>{`${schedule.start_time} - ${schedule.end_time}`}</TableCell>
-                  <TableCell>{schedule.slot_capacity || 12}</TableCell>
-                  <TableCell>{schedule.status || "available"}</TableCell>
-                  <TableCell>
-                    <div className="module-inline-actions">
-                      {canEdit ? (
-                        <>
-                          <Button
-                            type="button"
-                            onClick={() =>
-                              setScheduleForm({
-                                id: String(schedule.id),
-                                doctor_name: schedule.doctor_name,
-                                department: schedule.department || "",
-                                schedule_date: schedule.schedule_date,
-                                start_time: schedule.start_time,
-                                end_time: schedule.end_time,
-                                slot_capacity: String(
-                                  schedule.slot_capacity || 12,
-                                ),
-                                status: schedule.status || "available",
-                                notes: schedule.notes || "",
-                              })
-                            }
-                          >
-                            Edit
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="destructive"
-                            onClick={() => void deleteSchedule(schedule)}
-                          >
-                            Delete
-                          </Button>
-                        </>
-                      ) : (
-                        <span className="muted">Read only</span>
-                      )}
+          {/* Quick Queue & Workload Split */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1.25rem" }}>
+            {/* Quick Live Queue Snapshot */}
+            <div className="panel" style={{ background: "#ffffff", borderRadius: "10px", border: "1px solid #e2e8f0", padding: "1.25rem" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.75rem" }}>
+                <h4 style={{ margin: 0, fontSize: "0.95rem", fontWeight: 700, color: "#0f172a" }}>Live OP Queue Snapshot</h4>
+                <Button variant="ghost" size="sm" onClick={() => setActiveTab("queue")}>
+                  View Full Queue <FiArrowRight style={{ marginLeft: "4px" }} />
+                </Button>
+              </div>
+              {queueList.length === 0 ? (
+                <p className="muted" style={{ fontSize: "0.85rem" }}>No active patients waiting in queue today.</p>
+              ) : (
+                <div style={{ display: "grid", gap: "0.5rem" }}>
+                  {queueList.slice(0, 5).map((a) => (
+                    <div key={a.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "#f8fafc", padding: "0.6rem 0.85rem", borderRadius: "6px", border: "1px solid #e2e8f0" }}>
+                      <div>
+                        <strong style={{ color: "#059669", marginRight: "0.5rem" }}>OP #{a.token_no}</strong>
+                        <span style={{ fontWeight: 600, color: "#0f172a" }}>{a.patient_name}</span>
+                        <span style={{ marginLeft: "0.5rem", fontSize: "0.75rem", color: "#64748b" }}>
+                          UMR: {a.patient_id} · Dr: {a.doctor_name || "Unassigned"}
+                        </span>
+                      </div>
+                      <span style={{ fontSize: "0.75rem", padding: "0.15rem 0.5rem", borderRadius: "4px", fontWeight: 600, background: a.status === "in_consultation" ? "#fef3c7" : "#e0e7ff", color: a.status === "in_consultation" ? "#92400e" : "#3730a3" }}>
+                        {a.status.replace("_", " ")}
+                      </span>
                     </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </Table>
-          )}
-        </div>
+                  ))}
+                </div>
+              )}
+            </div>
 
-        <div className="panel">
-          <div className="module-panel-head">
-            <h3>Schedule OP Visit</h3>
+            {/* Doctor Availability & Workload */}
+            <div className="panel" style={{ background: "#ffffff", borderRadius: "10px", border: "1px solid #e2e8f0", padding: "1.25rem" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.75rem" }}>
+                <h4 style={{ margin: 0, fontSize: "0.95rem", fontWeight: 700, color: "#0f172a" }}>Doctor Workload & Status</h4>
+                <Button variant="ghost" size="sm" onClick={() => setActiveTab("doctors")}>
+                  Manage Doctors <FiArrowRight style={{ marginLeft: "4px" }} />
+                </Button>
+              </div>
+              <div style={{ display: "grid", gap: "0.5rem" }}>
+                {allDoctors.slice(0, 5).map((doc) => (
+                  <div key={doc.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "#f8fafc", padding: "0.6rem 0.85rem", borderRadius: "6px", border: "1px solid #e2e8f0" }}>
+                    <div>
+                      <strong style={{ color: "#0f172a" }}>{doc.doctor_name}</strong>
+                      <span style={{ marginLeft: "0.5rem", fontSize: "0.8rem", color: "#64748b" }}>
+                        {doc.department} · {doc.gender}
+                      </span>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                      <span style={{ fontSize: "0.75rem", color: "#475569" }}>{doc.current_workload} waiting</span>
+                      <span style={{ fontSize: "0.75rem", padding: "0.15rem 0.5rem", borderRadius: "4px", fontWeight: 600, background: doc.is_available ? "#dcfce7" : "#fee2e2", color: doc.is_available ? "#166534" : "#991b1b" }}>
+                        {doc.status}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
-          <form
-            className="module-form-grid module-sales-grid"
-            onSubmit={handleAppointmentSubmit}
-          >
-            <Input
-              value={appointmentForm.patient_id}
-              onChange={(event) =>
-                setAppointmentForm((current) => ({
-                  ...current,
-                  patient_id: event.target.value,
-                }))
-              }
-              placeholder="Patient ID"
-              aria-label="OP patient id"
-              disabled={!canEdit}
-            />
-            <Input
-              value={appointmentForm.patient_name}
-              onChange={(event) =>
-                setAppointmentForm((current) => ({
-                  ...current,
-                  patient_name: event.target.value,
-                }))
-              }
-              placeholder="Patient name"
-              aria-label="OP patient name"
-              disabled={!canEdit}
-            />
-            <Input
-              value={appointmentForm.doctor_name}
-              onChange={(event) => {
-                const nextDoctor = event.target.value;
-                const matched = schedules.find(
-                  (item) => item.doctor_name === nextDoctor,
-                );
-                setAppointmentForm((current) => ({
-                  ...current,
-                  doctor_name: nextDoctor,
-                  department: matched?.department || current.department,
-                }));
-              }}
-              placeholder="Doctor name"
-              aria-label="OP doctor"
-              disabled={!canEdit}
-              list="op-doctor-suggestions"
-            />
-            <datalist id="op-doctor-suggestions">
-              {doctorNames.map((name) => (
-                <option key={name} value={name} />
-              ))}
-            </datalist>
-            <Select
-              value={appointmentForm.department}
-              onChange={(event) =>
-                setAppointmentForm((current) => ({
-                  ...current,
-                  department: event.target.value,
-                }))
-              }
-              aria-label="OP department"
-              disabled={!canEdit}
-            >
-              <option value="">Select department</option>
-              {departments.map((department) => {
-                const name = (department.department_name || "").trim();
-                if (!name) return null;
-                return (
-                  <option key={department.id} value={name}>
-                    {name}
-                  </option>
-                );
-              })}
-            </Select>
-            <Input
-              type="datetime-local"
-              value={appointmentForm.appointment_date}
-              onChange={(event) =>
-                setAppointmentForm((current) => ({
-                  ...current,
-                  appointment_date: event.target.value,
-                }))
-              }
-              aria-label="OP appointment date"
-              disabled={!canEdit}
-            />
-            <Select
-              value={appointmentForm.appointment_kind}
-              onChange={(event) =>
-                setAppointmentForm((current) => ({
-                  ...current,
-                  appointment_kind: event.target.value,
-                }))
-              }
-              aria-label="Appointment kind"
-              disabled={!canEdit}
-            >
-              <option value="new">New Visit</option>
-              <option value="follow_up">Follow-up</option>
-            </Select>
-            <Select
-              value={appointmentForm.status}
-              onChange={(event) =>
-                setAppointmentForm((current) => ({
-                  ...current,
-                  status: event.target.value,
-                }))
-              }
-              aria-label="Appointment status"
-              disabled={!canEdit}
-            >
-              <option value="scheduled">Scheduled</option>
-              <option value="checked_in">Checked In</option>
-              <option value="in_consultation">In Consultation</option>
-              <option value="completed">Completed</option>
-              <option value="cancelled">Cancelled</option>
-            </Select>
-            <Select
-              value={appointmentForm.follow_up_for}
-              onChange={(event) =>
-                setAppointmentForm((current) => ({
-                  ...current,
-                  follow_up_for: event.target.value,
-                }))
-              }
-              aria-label="Follow up for"
-              disabled={
-                !canEdit || appointmentForm.appointment_kind !== "follow_up"
-              }
-            >
-              <option value="">Follow-up of</option>
-              {appointments.map((appointment) => (
-                <option key={appointment.id} value={appointment.id}>
-                  {`${appointment.patient_name} (#${appointment.token_no})`}
-                </option>
-              ))}
-            </Select>
-            <Input
-              type="number"
-              min={0}
-              value={appointmentForm.consultation_fee}
-              onChange={(event) =>
-                setAppointmentForm((current) => ({
-                  ...current,
-                  consultation_fee: event.target.value,
-                }))
-              }
-              placeholder="Consultation fee"
-              aria-label="OP consultation fee"
-              disabled={!canEdit}
-            />
-            <Select
-              value={appointmentForm.payment_mode}
-              onChange={(event) =>
-                setAppointmentForm((current) => ({
-                  ...current,
-                  payment_mode: event.target.value,
-                }))
-              }
-              aria-label="OP payment mode"
-              disabled={!canEdit}
-            >
-              <option value="upi">UPI</option>
-              <option value="card">Card</option>
-              <option value="bank">Bank Transfer</option>
-              <option value="cash">Cash</option>
-            </Select>
-            <Button
-              type="submit"
-              variant="primary"
-              disabled={!canEdit || savingAppointment}
-            >
-              {savingAppointment
-                ? "Saving..."
-                : appointmentForm.id
-                  ? "Update"
-                  : "Schedule"}
-            </Button>
-            <Button
-              type="button"
-              variant="secondary"
-              disabled={
-                !canEdit ||
-                savingAppointment ||
-                !!appointmentForm.id ||
-                !isRazorpayReady
-              }
-              onClick={() => void handleRazorpayAppointmentSubmit()}
-            >
-              {savingAppointment
-                ? "Processing..."
-                : "Pay via Razorpay & Schedule"}
-            </Button>
-          </form>
-          {!isRazorpayReady ? (
-            <p className="muted">
-              Razorpay payments are disabled until backend keys are configured.
-            </p>
-          ) : null}
+        </div>
+      )}
 
-          <Table
-            className="module-table module-table-op"
-            aria-label="OP appointments table"
-          >
+      {/* TAB 2: LIVE OP QUEUE & TRIAGE */}
+      {activeTab === "queue" && (
+        <div className="panel" style={{ background: "#ffffff", borderRadius: "10px", border: "1px solid #e2e8f0", padding: "1.25rem" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1rem", flexWrap: "wrap", gap: "0.5rem" }}>
+            <div>
+              <h3 style={{ fontSize: "1.1rem", fontWeight: 700, margin: 0, color: "#0f172a" }}>Active OP Queue</h3>
+              <p style={{ fontSize: "0.8rem", color: "#64748b", margin: "2px 0 0" }}>Manage patient consultations, vitals capture, and status progression</p>
+            </div>
+            <div style={{ display: "flex", gap: "0.5rem" }}>
+              <Input
+                placeholder="Search patient, UMR, or doctor..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                style={{ width: "240px", fontSize: "0.85rem" }}
+              />
+            </div>
+          </div>
+
+          <Table className="module-table module-table-op">
             <TableHead>
-              <TableCell>Token</TableCell>
-              <TableCell>Patient</TableCell>
-              <TableCell>Doctor</TableCell>
-              <TableCell>Time</TableCell>
-              <TableCell>Visit</TableCell>
-              <TableCell>Reminder</TableCell>
+              <TableCell>Token #</TableCell>
+              <TableCell>Patient & UMR</TableCell>
+              <TableCell>Gender / Age</TableCell>
+              <TableCell>Chief Complaint & Symptoms</TableCell>
+              <TableCell>Assigned Doctor</TableCell>
+              <TableCell>Status</TableCell>
               <TableCell>Actions</TableCell>
             </TableHead>
-            {appointments.length === 0 ? (
+            {queueList.length === 0 ? (
               <TableRow>
                 <TableCell>-</TableCell>
-                <TableCell>No appointments</TableCell>
+                <TableCell>No active patients in queue</TableCell>
+                <TableCell>-</TableCell>
                 <TableCell>-</TableCell>
                 <TableCell>-</TableCell>
                 <TableCell>-</TableCell>
                 <TableCell>-</TableCell>
               </TableRow>
             ) : (
-              appointments.map((appointment) => (
+              queueList.map((appointment) => (
                 <TableRow key={appointment.id}>
-                  <TableCell>{appointment.token_no}</TableCell>
-                  <TableCell>{appointment.patient_name}</TableCell>
-                  <TableCell>{appointment.doctor_name || "-"}</TableCell>
                   <TableCell>
-                    {formatDateTime(appointment.appointment_date)}
+                    <span style={{ fontWeight: 800, color: "#059669", fontSize: "1rem" }}>
+                      #{appointment.token_no}
+                    </span>
                   </TableCell>
                   <TableCell>
-                    {appointment.appointment_kind === "follow_up"
-                      ? "Follow-up"
-                      : "New"}
+                    <div>
+                      <strong style={{ color: "#0f172a" }}>{appointment.patient_name}</strong>
+                      <div style={{ fontSize: "0.75rem", color: "#64748b" }}>UMR: {appointment.patient_id}</div>
+                    </div>
                   </TableCell>
                   <TableCell>
-                    {appointment.reminder_sent_at ? "Sent" : "Pending"}
+                    <span style={{ fontSize: "0.85rem" }}>
+                      {appointment.patient_gender || "Other"} {appointment.patient_age ? `(${appointment.patient_age}y)` : ""}
+                    </span>
                   </TableCell>
                   <TableCell>
-                    <div className="module-inline-actions">
+                    <div style={{ maxWidth: "250px" }}>
+                      <div style={{ fontWeight: 600, color: "#1e293b", fontSize: "0.85rem" }}>
+                        {appointment.chief_complaint || "Routine Consultation"}
+                      </div>
+                      {appointment.symptoms && (
+                        <div style={{ fontSize: "0.75rem", color: "#64748b", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                          {appointment.symptoms}
+                        </div>
+                      )}
+                      {appointment.symptom_duration && (
+                        <span style={{ fontSize: "0.7rem", background: "#f1f5f9", padding: "0.1rem 0.35rem", borderRadius: "3px", color: "#475569" }}>
+                          Dur: {appointment.symptom_duration}
+                        </span>
+                      )}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <div>
+                      <strong style={{ fontSize: "0.875rem", color: "#0f172a" }}>{appointment.doctor_name || "Unassigned"}</strong>
+                      <div style={{ fontSize: "0.75rem", color: "#64748b" }}>{appointment.department || "General"}</div>
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <span style={{
+                      fontSize: "0.75rem",
+                      padding: "0.2rem 0.6rem",
+                      borderRadius: "999px",
+                      fontWeight: 600,
+                      background:
+                        appointment.status === "in_consultation" ? "#fef3c7"
+                        : appointment.status === "checked_in" ? "#dbeafe"
+                        : "#f1f5f9",
+                      color:
+                        appointment.status === "in_consultation" ? "#92400e"
+                        : appointment.status === "checked_in" ? "#1e40af"
+                        : "#475569",
+                    }}>
+                      {appointment.status.replace("_", " ")}
+                    </span>
+                  </TableCell>
+                  <TableCell>
+                    <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap" }}>
+                      {/* Vitals Button */}
                       <Button
                         type="button"
-                        onClick={() =>
-                          setUploadPrescriptionPatient({
-                            id: String(appointment.patient_id),
-                            name: appointment.patient_name,
-                          })
-                        }
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => handleOpenVitals(appointment)}
+                        title="Record Vitals"
                       >
-                        Upload Rx
+                        <FiHeart style={{ marginRight: "3px", color: "#e11d48" }} /> Vitals
                       </Button>
+
+                      {/* Advance Status Button */}
+                      {appointment.status === "scheduled" && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="primary"
+                          style={{ background: "#2563eb" }}
+                          onClick={() => void quickUpdateStatus(appointment, "checked_in")}
+                        >
+                          Check In
+                        </Button>
+                      )}
+                      {appointment.status === "checked_in" && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="primary"
+                          style={{ background: "#d97706" }}
+                          onClick={() => void quickUpdateStatus(appointment, "in_consultation")}
+                        >
+                          Start Consult
+                        </Button>
+                      )}
+                      {appointment.status === "in_consultation" && (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="primary"
+                          style={{ background: "#059669" }}
+                          onClick={() => void quickUpdateStatus(appointment, "completed")}
+                        >
+                          Complete
+                        </Button>
+                      )}
+
+                      {/* Open Timeline */}
                       <Button
                         type="button"
-                        onClick={() =>
-                          setAppointmentForm({
-                            id: String(appointment.id),
-                            patient_id: appointment.patient_id || "",
-                            patient_name: appointment.patient_name,
-                            visit_type: appointment.visit_type,
-                            department: appointment.department || "",
-                            doctor_name: appointment.doctor_name || "",
-                            appointment_date: toDateTimeLocalValue(
-                              appointment.appointment_date,
-                            ),
-                            status: appointment.status,
-                            appointment_kind:
-                              appointment.appointment_kind || "new",
-                            follow_up_for: appointment.follow_up_for
-                              ? String(appointment.follow_up_for)
-                              : "",
-                            consultation_fee: appointmentForm.consultation_fee,
-                            payment_mode: appointmentForm.payment_mode || "upi",
-                            notes: appointment.notes || "",
-                          })
-                        }
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => void handleOpenTimeline(appointment)}
+                        title="View OP Journey Timeline"
                       >
-                        Edit
+                        <FiClock />
                       </Button>
-                      {canEdit ? (
-                        <Button
-                          type="button"
-                          variant="secondary"
-                          onClick={() =>
-                            void quickUpdateAppointment(
-                              appointment,
-                              appointment.status === "scheduled"
-                                ? "checked_in"
-                                : appointment.status === "checked_in"
-                                  ? "in_consultation"
-                                  : "completed",
-                            )
-                          }
-                        >
-                          Advance
-                        </Button>
-                      ) : null}
-                      {canEdit && !appointment.reminder_sent_at ? (
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          onClick={() => void markReminderSent(appointment)}
-                        >
-                          Reminder
-                        </Button>
-                      ) : null}
-                      {canEdit &&
-                      appointment.status === "scheduled" &&
-                      !appointment.no_show_marked ? (
-                        <Button
-                          type="button"
-                          variant="destructive"
-                          onClick={() => void markNoShow(appointment)}
-                        >
-                          No-Show
-                        </Button>
-                      ) : null}
                     </div>
                   </TableCell>
                 </TableRow>
@@ -1063,7 +668,324 @@ export default function OpPage({ setNotice, canEdit }: Props) {
             )}
           </Table>
         </div>
-      </div>
+      )}
+
+      {/* TAB 3: OP ENCOUNTERS & TIMELINE */}
+      {activeTab === "encounters" && (
+        <div className="panel" style={{ background: "#ffffff", borderRadius: "10px", border: "1px solid #e2e8f0", padding: "1.25rem" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1rem", flexWrap: "wrap", gap: "0.5rem" }}>
+            <div>
+              <h3 style={{ fontSize: "1.1rem", fontWeight: 700, margin: 0, color: "#0f172a" }}>OP Encounters Log</h3>
+              <p style={{ fontSize: "0.8rem", color: "#64748b", margin: "2px 0 0" }}>All Outpatient encounters recorded for {selectedDate}</p>
+            </div>
+            <Input
+              placeholder="Filter encounters..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              style={{ width: "240px", fontSize: "0.85rem" }}
+            />
+          </div>
+
+          <Table className="module-table module-table-op">
+            <TableHead>
+              <TableCell>OP Token</TableCell>
+              <TableCell>Patient Name (UMR)</TableCell>
+              <TableCell>Doctor</TableCell>
+              <TableCell>Department</TableCell>
+              <TableCell>Status</TableCell>
+              <TableCell>Further Action</TableCell>
+              <TableCell>Timeline</TableCell>
+            </TableHead>
+            {filteredAppointments.length === 0 ? (
+              <TableRow>
+                <TableCell>-</TableCell>
+                <TableCell>No encounters recorded</TableCell>
+                <TableCell>-</TableCell>
+                <TableCell>-</TableCell>
+                <TableCell>-</TableCell>
+                <TableCell>-</TableCell>
+                <TableCell>-</TableCell>
+              </TableRow>
+            ) : (
+              filteredAppointments.map((app) => (
+                <TableRow key={app.id}>
+                  <TableCell><strong style={{ color: "#059669" }}>#{app.token_no}</strong></TableCell>
+                  <TableCell>
+                    <strong>{app.patient_name}</strong>
+                    <div style={{ fontSize: "0.75rem", color: "#64748b" }}>UMR: {app.patient_id}</div>
+                  </TableCell>
+                  <TableCell>{app.doctor_name || "-"}</TableCell>
+                  <TableCell>{app.department || "General"}</TableCell>
+                  <TableCell>
+                    <span style={{ fontSize: "0.75rem", padding: "0.15rem 0.5rem", borderRadius: "4px", fontWeight: 600, background: app.status === "completed" ? "#dcfce7" : "#f1f5f9", color: app.status === "completed" ? "#166534" : "#475569" }}>
+                      {app.status}
+                    </span>
+                  </TableCell>
+                  <TableCell>
+                    <span style={{ fontSize: "0.8rem", color: "#0284c7", fontWeight: 600 }}>
+                      {(app.further_action || "none").toUpperCase()}
+                    </span>
+                  </TableCell>
+                  <TableCell>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => void handleOpenTimeline(app)}
+                    >
+                      <FiEye style={{ marginRight: "4px" }} /> View Timeline
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))
+            )}
+          </Table>
+        </div>
+      )}
+
+      {/* TAB 4: DOCTOR DIRECTORY & SCHEDULES */}
+      {activeTab === "doctors" && (
+        <div style={{ display: "grid", gap: "1.25rem" }}>
+          <div className="panel" style={{ background: "#ffffff", borderRadius: "10px", border: "1px solid #e2e8f0", padding: "1.25rem" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1rem" }}>
+              <div>
+                <h3 style={{ fontSize: "1.1rem", fontWeight: 700, margin: 0, color: "#0f172a" }}>Doctor Roster & Availability</h3>
+                <p style={{ fontSize: "0.8rem", color: "#64748b", margin: "2px 0 0" }}>Gender balance, consultation fees, and real-time workload</p>
+              </div>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: "1rem" }}>
+              {allDoctors.map((doc) => (
+                <div key={doc.id} style={{ border: "1px solid #e2e8f0", borderRadius: "8px", padding: "1rem", background: "#f8fafc" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "0.5rem" }}>
+                    <strong style={{ fontSize: "0.95rem", color: "#0f172a" }}>{doc.doctor_name}</strong>
+                    <span style={{
+                      fontSize: "0.75rem",
+                      padding: "0.15rem 0.5rem",
+                      borderRadius: "999px",
+                      fontWeight: 600,
+                      background: doc.is_available ? "#dcfce7" : "#fee2e2",
+                      color: doc.is_available ? "#166534" : "#991b1b",
+                    }}>
+                      {doc.status}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: "0.825rem", color: "#475569", marginBottom: "0.5rem" }}>
+                    <div><strong>Specialty:</strong> {doc.department}</div>
+                    <div><strong>Gender:</strong> {doc.gender}</div>
+                    <div><strong>Consultation Fee:</strong> ₹{doc.consultation_fee} (Review: ₹{doc.review_fee})</div>
+                    <div><strong>Current Queue:</strong> {doc.current_workload} waiting</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: RECORD VITALS */}
+      {vitalsAppointment && (
+        <div style={{
+          position: "fixed",
+          inset: 0,
+          background: "rgba(0,0,0,0.5)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 1000,
+          padding: "1rem",
+        }}>
+          <div style={{
+            background: "#ffffff",
+            borderRadius: "12px",
+            width: "100%",
+            maxWidth: "520px",
+            padding: "1.5rem",
+            boxShadow: "0 20px 25px -5px rgba(0,0,0,0.1)",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1rem", borderBottom: "1px solid #f1f5f9", paddingBottom: "0.5rem" }}>
+              <div>
+                <h3 style={{ margin: 0, fontSize: "1.1rem", fontWeight: 700, color: "#0f172a" }}>
+                  Record Patient Vitals
+                </h3>
+                <p style={{ margin: "2px 0 0", fontSize: "0.8rem", color: "#64748b" }}>
+                  OP #{vitalsAppointment.token_no} · {vitalsAppointment.patient_name} (UMR: {vitalsAppointment.patient_id})
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setVitalsAppointment(null)}
+                style={{ background: "transparent", border: "none", fontSize: "1.2rem", cursor: "pointer", color: "#94a3b8" }}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.75rem", marginBottom: "1rem" }}>
+              <div>
+                <label style={{ fontSize: "0.8rem", fontWeight: 600, color: "#334155" }}>Blood Pressure (e.g. 120/80)</label>
+                <Input
+                  value={vitalsForm.bp}
+                  onChange={(e) => setVitalsForm((prev) => ({ ...prev, bp: e.target.value }))}
+                  placeholder="120/80 mmHg"
+                />
+              </div>
+              <div>
+                <label style={{ fontSize: "0.8rem", fontWeight: 600, color: "#334155" }}>Heart Rate / Pulse (bpm)</label>
+                <Input
+                  value={vitalsForm.pulse}
+                  onChange={(e) => setVitalsForm((prev) => ({ ...prev, pulse: e.target.value }))}
+                  placeholder="72 bpm"
+                />
+              </div>
+              <div>
+                <label style={{ fontSize: "0.8rem", fontWeight: 600, color: "#334155" }}>Temperature (°F)</label>
+                <Input
+                  value={vitalsForm.temperature}
+                  onChange={(e) => setVitalsForm((prev) => ({ ...prev, temperature: e.target.value }))}
+                  placeholder="98.6 °F"
+                />
+              </div>
+              <div>
+                <label style={{ fontSize: "0.8rem", fontWeight: 600, color: "#334155" }}>Oxygen Saturation (SpO2 %)</label>
+                <Input
+                  value={vitalsForm.spo2}
+                  onChange={(e) => setVitalsForm((prev) => ({ ...prev, spo2: e.target.value }))}
+                  placeholder="98 %"
+                />
+              </div>
+              <div>
+                <label style={{ fontSize: "0.8rem", fontWeight: 600, color: "#334155" }}>Respiratory Rate (/min)</label>
+                <Input
+                  value={vitalsForm.respiratory_rate}
+                  onChange={(e) => setVitalsForm((prev) => ({ ...prev, respiratory_rate: e.target.value }))}
+                  placeholder="16 /min"
+                />
+              </div>
+              <div>
+                <label style={{ fontSize: "0.8rem", fontWeight: 600, color: "#334155" }}>Weight (kg)</label>
+                <Input
+                  value={vitalsForm.weight}
+                  onChange={(e) => setVitalsForm((prev) => ({ ...prev, weight: e.target.value }))}
+                  placeholder="65 kg"
+                />
+              </div>
+              <div style={{ gridColumn: "1 / -1" }}>
+                <label style={{ fontSize: "0.8rem", fontWeight: 600, color: "#334155" }}>Blood Glucose (mg/dL)</label>
+                <Input
+                  value={vitalsForm.blood_glucose}
+                  onChange={(e) => setVitalsForm((prev) => ({ ...prev, blood_glucose: e.target.value }))}
+                  placeholder="e.g. 110 mg/dL"
+                />
+              </div>
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: "0.5rem" }}>
+              <Button type="button" variant="secondary" onClick={() => setVitalsAppointment(null)}>
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="primary"
+                style={{ background: "#059669" }}
+                onClick={() => void handleSaveVitals()}
+                disabled={savingVitals}
+              >
+                {savingVitals ? "Saving..." : "Save Vitals & Log Event"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: OP TIMELINE VIEWER */}
+      {timelineAppointment && (
+        <div style={{
+          position: "fixed",
+          inset: 0,
+          background: "rgba(0,0,0,0.5)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 1000,
+          padding: "1rem",
+        }}>
+          <div style={{
+            background: "#ffffff",
+            borderRadius: "12px",
+            width: "100%",
+            maxWidth: "600px",
+            padding: "1.5rem",
+            boxShadow: "0 20px 25px -5px rgba(0,0,0,0.1)",
+            maxHeight: "85vh",
+            display: "flex",
+            flexDirection: "column",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1rem", borderBottom: "1px solid #f1f5f9", paddingBottom: "0.5rem" }}>
+              <div>
+                <h3 style={{ margin: 0, fontSize: "1.1rem", fontWeight: 700, color: "#0f172a" }}>
+                  OP Journey Timeline
+                </h3>
+                <p style={{ margin: "2px 0 0", fontSize: "0.8rem", color: "#64748b" }}>
+                  OP #{timelineAppointment.token_no} · {timelineAppointment.patient_name} (UMR: {timelineAppointment.patient_id})
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setTimelineAppointment(null)}
+                style={{ background: "transparent", border: "none", fontSize: "1.2rem", cursor: "pointer", color: "#94a3b8" }}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div style={{ flex: 1, overflowY: "auto", paddingRight: "0.5rem" }}>
+              {loadingTimeline ? (
+                <p style={{ fontSize: "0.85rem", color: "#64748b" }}>Loading timeline events...</p>
+              ) : timelineEvents.length === 0 ? (
+                <p style={{ fontSize: "0.85rem", color: "#64748b" }}>No events logged yet for this visit.</p>
+              ) : (
+                <div style={{ position: "relative", borderLeft: "2px solid #e2e8f0", marginLeft: "1rem", paddingLeft: "1.25rem" }}>
+                  {timelineEvents.map((evt, idx) => (
+                    <div key={evt.id || idx} style={{ marginBottom: "1.25rem", position: "relative" }}>
+                      {/* Timeline Node Dot */}
+                      <div style={{
+                        position: "absolute",
+                        left: "-1.75rem",
+                        top: "0.2rem",
+                        width: "12px",
+                        height: "12px",
+                        borderRadius: "50%",
+                        background: "#059669",
+                        border: "2px solid #ffffff",
+                        boxShadow: "0 0 0 2px #a7f3d0",
+                      }} />
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                        <strong style={{ fontSize: "0.9rem", color: "#0f172a" }}>{evt.event_name}</strong>
+                        <span style={{ fontSize: "0.75rem", color: "#94a3b8" }}>{formatDateTime(evt.created_at)}</span>
+                      </div>
+                      <p style={{ margin: "4px 0 2px", fontSize: "0.825rem", color: "#475569" }}>
+                        {evt.event_description}
+                      </p>
+                      {evt.actor && (
+                        <span style={{ fontSize: "0.7rem", color: "#64748b", background: "#f1f5f9", padding: "0.1rem 0.4rem", borderRadius: "3px" }}>
+                          Actor: {evt.actor}
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "1rem", borderTop: "1px solid #f1f5f9", paddingTop: "0.75rem" }}>
+              <Button type="button" variant="secondary" onClick={() => setTimelineAppointment(null)}>
+                Close
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {uploadPrescriptionPatient && (
         <PrescriptionUploadModal

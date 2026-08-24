@@ -1125,5 +1125,5 @@ def export_pdf():
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5002"))
+    port = int(os.getenv("SYMPTOM_PORT", "5002"))
     app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG", "").lower() == "true")

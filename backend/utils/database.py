@@ -478,6 +478,7 @@ def init_database():
         ensure_appointment_timestamp_columns(conn)
         ensure_pharmacy_hospital_columns(conn)
         ensure_bed_billing_columns(conn)
+        ensure_op_tables(conn)
 
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_hospitals_code ON hospitals(code)"
@@ -885,6 +886,11 @@ def ensure_hospai_module_tables(conn):
             created_by TEXT
         )
         """)
+    _ensure_column(cursor, "encounters", "appointment_id", "INTEGER")
+    _ensure_column(cursor, "encounters", "hospital_id", "INTEGER")
+    _ensure_column(cursor, "encounters", "op_number", "INTEGER")
+    _ensure_column(cursor, "encounters", "chief_complaint", "TEXT")
+    _ensure_column(cursor, "encounters", "symptoms", "TEXT")
 
     cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS bed_allocations (
@@ -969,6 +975,10 @@ def ensure_hospai_module_tables(conn):
         cursor.execute("ALTER TABLE invoices ADD COLUMN advance_amount REAL DEFAULT 0")
     if "refunded_amount" not in invoice_columns:
         cursor.execute("ALTER TABLE invoices ADD COLUMN refunded_amount REAL DEFAULT 0")
+    if "appointment_id" not in invoice_columns:
+        cursor.execute("ALTER TABLE invoices ADD COLUMN appointment_id INTEGER")
+    if "encounter_id" not in invoice_columns:
+        cursor.execute("ALTER TABLE invoices ADD COLUMN encounter_id INTEGER")
 
     cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS invoice_payments (
@@ -1218,6 +1228,14 @@ def ensure_hospai_module_tables(conn):
         cursor.execute(
             "ALTER TABLE appointments ADD COLUMN no_show_marked INTEGER DEFAULT 0"
         )
+    if "encounter_id" not in appointment_columns:
+        cursor.execute("ALTER TABLE appointments ADD COLUMN encounter_id INTEGER")
+    if "chief_complaint" not in appointment_columns:
+        cursor.execute("ALTER TABLE appointments ADD COLUMN chief_complaint TEXT")
+    if "symptoms" not in appointment_columns:
+        cursor.execute("ALTER TABLE appointments ADD COLUMN symptoms TEXT")
+    if "ai_recommendation" not in appointment_columns:
+        cursor.execute("ALTER TABLE appointments ADD COLUMN ai_recommendation TEXT")
 
     cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS doctor_schedules (
@@ -3483,6 +3501,62 @@ def create_appointment(data, hospital_id=None):
     scoped_hospital_id = hospital_id or resolve_hospital_id()
     with get_connection() as conn:
         cursor = conn.cursor()
+        
+        # 1. Resolve Patient ID (Generate permanent UMR if missing)
+        resolved_patient_id = (data.get("patient_id") or "").strip()
+        patient_name = (data.get("patient_name") or "").strip()
+        patient_gender = (data.get("patient_gender") or data.get("gender") or "Male").strip().capitalize()
+        if patient_gender not in ("Male", "Female"):
+            patient_gender = "Other"
+        patient_phone = (data.get("patient_phone") or data.get("phone") or "").strip()
+        patient_age = data.get("patient_age") or data.get("age")
+        if patient_age is not None:
+            try:
+                patient_age = int(patient_age)
+            except Exception:
+                patient_age = None
+
+        if not resolved_patient_id:
+            parts = patient_name.split(None, 1)
+            first_name = parts[0] if parts else "Walk-in"
+            last_name = parts[1] if len(parts) > 1 else ""
+
+            # Check if matching patient exists
+            cursor.execute(
+                """
+                SELECT patient_id FROM patients 
+                WHERE hospital_id = ? AND deleted_at IS NULL 
+                  AND LOWER(name) = LOWER(?) AND (LOWER(last_name) = LOWER(?) OR ? = '') 
+                  AND (? = '' OR phone = ?)
+                LIMIT 1 FOR UPDATE
+                """,
+                (scoped_hospital_id, first_name, last_name, last_name, patient_phone, patient_phone),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                resolved_patient_id = existing["patient_id"]
+            else:
+                cursor.execute(
+                    "SELECT patient_id FROM patients WHERE hospital_id = ? AND patient_id LIKE ? ORDER BY CAST(SUBSTR(patient_id, 5) AS INTEGER) DESC LIMIT 1 FOR UPDATE",
+                    (scoped_hospital_id, "PAT-1%"),
+                )
+                latest = cursor.fetchone()
+                next_number = 100001
+                if latest:
+                    try:
+                        next_number = int(latest["patient_id"].split("-")[1]) + 1
+                    except Exception:
+                        pass
+                resolved_patient_id = f"PAT-{next_number}"
+                cursor.execute(
+                    """
+                    INSERT INTO patients (
+                        hospital_id, patient_id, name, last_name, gender, age, phone
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (scoped_hospital_id, resolved_patient_id, first_name, last_name, patient_gender, patient_age, patient_phone),
+                )
+
         cursor.execute(
             _to_sql_params(
                 "SELECT COALESCE(MAX(token_no), 0) AS value FROM appointments "
@@ -3492,38 +3566,455 @@ def create_appointment(data, hospital_id=None):
         )
         token_no = int((cursor.fetchone() or {"value": 0})["value"] or 0) + 1
 
+        # 2. Create Encounter if OP
+        visit_type = data.get("visit_type", "OP")
+        doctor_name = data.get("doctor_name")
+        initial_status = data.get("status") or ("checked_in" if doctor_name else "scheduled")
+        op_status = "doctor_assigned" if doctor_name else "queued"
+        chief_complaint = data.get("chief_complaint") or data.get("notes") or ""
+        symptoms = data.get("symptoms") or ""
+        symptom_duration = data.get("symptom_duration") or ""
+        symptom_severity = data.get("symptom_severity") or "moderate"
+        created_by = data.get("created_by") or "reception"
+
+        cursor.execute(
+            """
+            INSERT INTO encounters (
+                patient_id, encounter_type, status, created_by, hospital_id, op_number,
+                chief_complaint, symptoms, symptom_duration, symptom_severity
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+            """,
+            (
+                resolved_patient_id, visit_type, initial_status, created_by, scoped_hospital_id,
+                token_no, chief_complaint, symptoms, symptom_duration, symptom_severity
+            ),
+        )
+        encounter_id = cursor.fetchone()[0]
+
+        # 3. Create Appointment
         insert_sql = """
             INSERT INTO appointments (
                 patient_id, patient_name, visit_type, department, doctor_name,
                 appointment_date, token_no, status, notes, appointment_kind, follow_up_for,
-                reminder_sent_at, no_show_marked, hospital_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                reminder_sent_at, no_show_marked, hospital_id, encounter_id,
+                chief_complaint, symptoms, symptom_duration, symptom_severity,
+                ai_recommendation, gender_preference, op_status, consultation_fee, payment_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
         """
-        insert_sql += " RETURNING id"
 
         cursor.execute(
             _to_sql_params(insert_sql),
             (
-                data.get("patient_id"),
-                data["patient_name"],
-                data.get("visit_type", "OP"),
+                resolved_patient_id,
+                patient_name,
+                visit_type,
                 data.get("department"),
-                data.get("doctor_name"),
+                doctor_name,
                 appointment_date,
                 token_no,
-                data.get("status", "scheduled"),
+                initial_status,
                 data.get("notes"),
                 data.get("appointment_kind", "new"),
                 data.get("follow_up_for"),
                 data.get("reminder_sent_at"),
                 1 if data.get("no_show_marked") else 0,
                 scoped_hospital_id,
+                encounter_id,
+                chief_complaint,
+                symptoms,
+                symptom_duration,
+                symptom_severity,
+                data.get("ai_recommendation"),
+                data.get("gender_preference") or patient_gender,
+                op_status,
+                float(data.get("consultation_fee") or 0),
+                data.get("payment_mode", "cash"),
             ),
         )
 
         appointment_id = cursor.fetchone()[0]
+        cursor.execute("UPDATE encounters SET appointment_id = ? WHERE id = ?", (appointment_id, encounter_id))
+
+        # 4. Record OP Timeline Event
+        cursor.execute(
+            """
+            INSERT INTO op_timeline (
+                hospital_id, appointment_id, encounter_id, patient_id, event_name, event_description, actor
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scoped_hospital_id, appointment_id, encounter_id, resolved_patient_id,
+                "Registered",
+                f"OP Visit registered. Assigned OP #{token_no} for UMR {resolved_patient_id}. Doctor: {doctor_name or 'Unassigned'}",
+                created_by,
+            ),
+        )
+
         conn.commit()
-        return appointment_id, token_no
+        return appointment_id, token_no, resolved_patient_id
+
+
+def record_op_timeline_event(appointment_id, event_name, event_description, actor=None, patient_id=None, encounter_id=None, hospital_id=None):
+    scoped_hospital_id = hospital_id or resolve_hospital_id()
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            p_id = patient_id
+            enc_id = encounter_id
+            if appointment_id and (not p_id or not enc_id):
+                cursor.execute("SELECT patient_id, encounter_id FROM appointments WHERE id = ?", (appointment_id,))
+                row = cursor.fetchone()
+                if row:
+                    p_id = p_id or row["patient_id"]
+                    enc_id = enc_id or row["encounter_id"]
+            if not p_id:
+                p_id = "UNKNOWN"
+            cursor.execute(
+                """
+                INSERT INTO op_timeline (hospital_id, appointment_id, encounter_id, patient_id, event_name, event_description, actor)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (scoped_hospital_id, appointment_id, enc_id, p_id, event_name, event_description, actor or "system"),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def check_patient_match(term, hospital_id=None):
+    """Fast server-side search to detect whether a patient is NEW or ALREADY EXISTING."""
+    if not term or len(term.strip()) < 2:
+        return {"matches": [], "is_match": False}
+    clean = term.strip()
+    scoped_hospital_id = hospital_id or resolve_hospital_id()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        search_pattern = f"%{clean}%"
+        cursor.execute(
+            """
+            SELECT p.patient_id, p.name, p.middle_name, p.last_name, p.phone, p.gender, p.age, p.dob, p.blood_group, p.created_at,
+                   (SELECT COUNT(*) FROM appointments a WHERE a.patient_id = p.patient_id AND a.hospital_id = p.hospital_id AND a.visit_type = 'OP') AS total_op_visits
+            FROM patients p
+            WHERE p.hospital_id = ? AND p.deleted_at IS NULL
+              AND (
+                  p.patient_id ILIKE ?
+                  OR p.name ILIKE ?
+                  OR p.last_name ILIKE ?
+                  OR p.phone ILIKE ?
+                  OR (p.name || ' ' || COALESCE(p.last_name, '')) ILIKE ?
+                  OR (p.name || ' ' || COALESCE(p.middle_name, '') || ' ' || COALESCE(p.last_name, '')) ILIKE ?
+              )
+            ORDER BY p.name ASC
+            LIMIT 10
+            """,
+            (scoped_hospital_id, search_pattern, search_pattern, search_pattern, search_pattern, search_pattern, search_pattern),
+        )
+        rows = cursor.fetchall()
+        matches = []
+        for r in rows:
+            full_name = f"{r['name']} {r['middle_name'] or ''} {r['last_name'] or ''}".strip()
+            matches.append({
+                "patient_id": r["patient_id"],
+                "name": r["name"],
+                "middle_name": r["middle_name"] or "",
+                "last_name": r["last_name"] or "",
+                "full_name": full_name,
+                "phone": r["phone"] or "",
+                "gender": r["gender"] or "Other",
+                "age": r["age"],
+                "dob": r["dob"],
+                "blood_group": r["blood_group"] or "",
+                "created_at": str(r["created_at"]) if r["created_at"] else "",
+                "total_op_visits": r["total_op_visits"] or 0,
+            })
+        return {"matches": matches, "is_match": len(matches) > 0}
+
+
+def get_eligible_op_doctors(department=None, patient_gender=None, doctor_gender_preference=None, hospital_id=None):
+    """Implement gender-matching and availability rule for OP doctor assignment.
+    Male Patient -> Male Doctor of Required Specialty
+    Female Patient -> Female Doctor of Required Specialty
+    Fallback to other available doctor of same specialty if none available."""
+    scoped_hospital_id = hospital_id or resolve_hospital_id()
+    today = current_ist_datetime().strftime("%Y-%m-%d")
+
+    desired_gender = (doctor_gender_preference or patient_gender or "").strip().capitalize()
+    if desired_gender not in ("Male", "Female"):
+        desired_gender = None
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, doctor_name, department, gender, consultation_fee, review_fee, status FROM doctors ORDER BY doctor_name ASC")
+        doc_rows = cursor.fetchall()
+
+        cursor.execute(
+            """
+            SELECT doctor_name, COUNT(*) as count
+            FROM appointments
+            WHERE hospital_id = ? AND visit_type = 'OP' AND DATE(appointment_date) = DATE(?)
+              AND status IN ('scheduled', 'checked_in', 'in_consultation')
+            GROUP BY doctor_name
+            """,
+            (scoped_hospital_id, today),
+        )
+        workload_map = {row["doctor_name"]: row["count"] for row in cursor.fetchall()}
+
+        doctors_list = []
+        for d in doc_rows:
+            d_name = d["doctor_name"]
+            d_dept = d["department"] or "General"
+            d_gender = d["gender"] or "Male"
+            d_status = (d["status"] or "available").lower()
+            workload = workload_map.get(d_name, 0)
+
+            dept_matches = True
+            if department and department.strip():
+                req_dept = department.strip().lower()
+                dept_matches = req_dept in d_dept.lower() or d_dept.lower() in req_dept
+
+            gender_matches = (desired_gender is None) or (d_gender.lower() == desired_gender.lower())
+            is_available = (d_status == "available")
+
+            score = 0
+            if dept_matches:
+                score += 100
+            if gender_matches:
+                score += 50
+            if is_available:
+                score += 30
+            score += max(0, 20 - workload)
+
+            doctors_list.append({
+                "id": d["id"],
+                "doctor_name": d_name,
+                "department": d_dept,
+                "gender": d_gender,
+                "consultation_fee": d["consultation_fee"] or 0,
+                "review_fee": d["review_fee"] or 0,
+                "status": d_status,
+                "current_workload": workload,
+                "department_matches": dept_matches,
+                "gender_matches": gender_matches,
+                "is_available": is_available,
+                "match_score": score,
+            })
+
+        doctors_list.sort(key=lambda x: (-x["match_score"], -int(x["department_matches"]), -int(x["gender_matches"]), x["current_workload"]))
+
+        recommended = None
+        # 1. Department match + Gender match + Available
+        for doc in doctors_list:
+            if doc["department_matches"] and doc["gender_matches"] and doc["is_available"]:
+                recommended = doc
+                break
+        # 2. If primary doctor is unavailable/busy, fallback to another available doctor of SAME gender
+        if not recommended:
+            for doc in doctors_list:
+                if doc["gender_matches"] and doc["is_available"]:
+                    recommended = doc
+                    break
+        # 3. Department match + Available
+        if not recommended:
+            for doc in doctors_list:
+                if doc["department_matches"] and doc["is_available"]:
+                    recommended = doc
+                    break
+        if not recommended and doctors_list:
+            recommended = doctors_list[0]
+
+        recommendation_action = "assign" if (recommended and recommended["is_available"]) else "queue"
+
+        return {
+            "doctors": doctors_list,
+            "recommended_doctor": recommended,
+            "recommendation_action": recommendation_action,
+            "desired_gender": desired_gender,
+            "department": department,
+        }
+
+
+def register_op_visit(patient_data=None, patient_id=None, appointment_data=None, hospital_id=None):
+    """Resolve one patient UMR and create one linked OP encounter atomically.
+    1 PATIENT = 1 UMR | 1 OP VISIT = 1 OP NUMBER"""
+    scoped_hospital_id = hospital_id or resolve_hospital_id()
+    appointment_data = appointment_data or {}
+    created_by = appointment_data.get("created_by") or "reception"
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        is_new_patient = False
+
+        if patient_id:
+            cursor.execute(
+                "SELECT * FROM patients WHERE patient_id = ? AND hospital_id = ? AND deleted_at IS NULL FOR UPDATE",
+                (patient_id, scoped_hospital_id),
+            )
+            patient = cursor.fetchone()
+            if not patient:
+                raise ValueError("Patient not found")
+            resolved_patient_id = patient_id
+            patient_name = f"{patient['name']} {patient['last_name']}".strip()
+            patient_gender = patient.get("gender") or "Other"
+        else:
+            is_new_patient = True
+            required = patient_data or {}
+            if not required.get("name") or not required.get("last_name"):
+                raise ValueError("Patient name and last name are required")
+            
+            cursor.execute(
+                "SELECT patient_id FROM patients WHERE hospital_id = ? AND deleted_at IS NULL AND LOWER(name) = LOWER(?) AND LOWER(last_name) = LOWER(?) AND (dob = ? OR phone = ?) FOR UPDATE",
+                (scoped_hospital_id, required["name"], required["last_name"], required.get("dob"), required.get("phone")),
+            )
+            duplicate = cursor.fetchone()
+            if duplicate:
+                raise ValueError(f"Existing patient match found with UMR {duplicate['patient_id']}. Please select the existing patient.")
+
+            cursor.execute(
+                "SELECT patient_id FROM patients WHERE hospital_id = ? AND patient_id LIKE ? ORDER BY CAST(SUBSTR(patient_id, 5) AS INTEGER) DESC LIMIT 1 FOR UPDATE",
+                (scoped_hospital_id, "PAT-1%"),
+            )
+            latest = cursor.fetchone()
+            next_number = 100001
+            if latest:
+                try:
+                    next_number = int(latest["patient_id"].split("-")[1]) + 1
+                except (IndexError, ValueError):
+                    pass
+            resolved_patient_id = f"PAT-{next_number}"
+            cursor.execute(
+                """
+                INSERT INTO patients (
+                    hospital_id, patient_id, name, middle_name, last_name, dob, age,
+                    weight, height, gender, pregnant, allergies, symptoms, phone,
+                    address, blood_group, emergency_contact, aadhar_number
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scoped_hospital_id, resolved_patient_id, required["name"], required.get("middle_name", ""),
+                    required["last_name"], required.get("dob"), required.get("age"), required.get("weight"),
+                    required.get("height"), required.get("gender") or "Other", 1 if required.get("pregnant") else 0,
+                    required.get("allergies", ""), required.get("symptoms", ""), required.get("phone", ""),
+                    required.get("address", ""), required.get("blood_group", ""), required.get("emergency_contact", ""),
+                    required.get("aadhar_number", "")
+                ),
+            )
+            patient_name = f"{required['name']} {required['last_name']}".strip()
+            patient_gender = required.get("gender") or "Other"
+
+        cursor.execute("LOCK TABLE appointments IN SHARE ROW EXCLUSIVE MODE")
+        appt_date = appointment_data.get("appointment_date") or current_ist_datetime().isoformat()
+        cursor.execute(
+            "SELECT COALESCE(MAX(token_no), 0) AS value FROM appointments WHERE DATE(appointment_date) = DATE(?) AND hospital_id = ? AND visit_type = 'OP'",
+            (appt_date, scoped_hospital_id),
+        )
+        token_no = int((cursor.fetchone() or {"value": 0})["value"] or 0) + 1
+
+        doctor_name = appointment_data.get("doctor_name")
+        initial_status = appointment_data.get("status") or ("checked_in" if doctor_name else "scheduled")
+        op_status = "doctor_assigned" if doctor_name else "queued"
+
+        chief_complaint = appointment_data.get("chief_complaint") or appointment_data.get("notes") or ""
+        symptoms = appointment_data.get("symptoms") or ""
+        symptom_duration = appointment_data.get("symptom_duration") or ""
+        symptom_severity = appointment_data.get("symptom_severity") or "moderate"
+        ai_rec = appointment_data.get("ai_recommendation") or ""
+        gender_pref = appointment_data.get("gender_preference") or patient_gender
+        consultation_fee = float(appointment_data.get("consultation_fee") or 0)
+        payment_mode = appointment_data.get("payment_mode") or "cash"
+
+        cursor.execute(
+            """
+            INSERT INTO encounters (
+                patient_id, encounter_type, status, created_by, hospital_id, op_number,
+                chief_complaint, symptoms, symptom_duration, symptom_severity
+            ) VALUES (?, 'OP', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+            """,
+            (
+                resolved_patient_id, initial_status, created_by, scoped_hospital_id,
+                token_no, chief_complaint, symptoms, symptom_duration, symptom_severity
+            ),
+        )
+        encounter_id = cursor.fetchone()[0]
+
+        cursor.execute(
+            """
+            INSERT INTO appointments (
+                patient_id, patient_name, visit_type, department, doctor_name,
+                appointment_date, token_no, status, notes, appointment_kind,
+                follow_up_for, hospital_id, encounter_id, chief_complaint, symptoms,
+                symptom_duration, symptom_severity, ai_recommendation, gender_preference,
+                op_status, consultation_fee, payment_mode, checked_in_at
+            ) VALUES (?, ?, 'OP', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            RETURNING id
+            """,
+            (
+                resolved_patient_id, patient_name, appointment_data.get("department"), doctor_name,
+                appt_date, token_no, initial_status, appointment_data.get("notes"),
+                appointment_data.get("appointment_kind", "new" if is_new_patient else "revisit"),
+                appointment_data.get("follow_up_for"), scoped_hospital_id, encounter_id,
+                chief_complaint, symptoms, symptom_duration, symptom_severity, ai_rec,
+                gender_pref, op_status, consultation_fee, payment_mode
+            ),
+        )
+        appointment_id = cursor.fetchone()[0]
+
+        cursor.execute("UPDATE encounters SET appointment_id = ? WHERE id = ?", (appointment_id, encounter_id))
+
+        cursor.execute(
+            """
+            INSERT INTO op_timeline (
+                hospital_id, appointment_id, encounter_id, patient_id, event_name, event_description, actor
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scoped_hospital_id, appointment_id, encounter_id, resolved_patient_id,
+                "Registered",
+                f"OP Visit registered. Assigned OP #{token_no} for UMR {resolved_patient_id} ({'New Patient' if is_new_patient else 'Revisit'}). Doctor: {doctor_name or 'Unassigned'}",
+                created_by
+            ),
+        )
+
+        if consultation_fee > 0:
+            cursor.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM invoices")
+            next_inv_id = cursor.fetchone()[0]
+            invoice_no = f"INV-OP-{next_inv_id:05d}"
+            cursor.execute(
+                """
+                INSERT INTO invoices (
+                    invoice_no, patient_id, module, doctor_name, subtotal, tax, discount,
+                    total_amount, paid_amount, due_amount, payment_status, created_by,
+                    hospital_id, appointment_id, encounter_id
+                ) VALUES (?, ?, 'OP', ?, ?, 0, 0, ?, ?, 0, 'paid', ?, ?, ?, ?)
+                RETURNING id
+                """,
+                (
+                    invoice_no, resolved_patient_id, doctor_name or "OP Desk", consultation_fee,
+                    consultation_fee, consultation_fee, created_by, scoped_hospital_id,
+                    appointment_id, encounter_id
+                ),
+            )
+            inv_id = cursor.fetchone()[0]
+            cursor.execute(
+                """
+                INSERT INTO invoice_payments (
+                    invoice_id, amount, payment_mode, created_by, hospital_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (inv_id, consultation_fee, payment_mode, created_by, scoped_hospital_id),
+            )
+
+        conn.commit()
+        return {
+            "patient_id": resolved_patient_id,
+            "encounter_id": encounter_id,
+            "appointment_id": appointment_id,
+            "op_number": token_no,
+            "patient_name": patient_name,
+            "is_new_patient": is_new_patient,
+            "status": initial_status,
+            "op_status": op_status,
+        }
 
 
 def list_appointments(
@@ -3558,10 +4049,466 @@ def list_appointments(
             params.append(patient_id)
         where_clause = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         cursor.execute(
-            f"SELECT a.*, p.phone as patient_phone, p.symptoms as patient_symptoms FROM appointments a LEFT JOIN patients p ON a.patient_id = p.patient_id AND a.hospital_id = p.hospital_id{where_clause} ORDER BY a.appointment_date ASC, a.token_no ASC",
+            f"SELECT a.*, p.phone as patient_phone, p.symptoms as patient_symptoms, p.gender as patient_gender, p.age as patient_age, p.blood_group as patient_blood_group FROM appointments a LEFT JOIN patients p ON a.patient_id = p.patient_id AND a.hospital_id = p.hospital_id{where_clause} ORDER BY a.appointment_date ASC, a.token_no ASC",
             tuple(params),
         )
         return cursor.fetchall()
+
+
+def get_op_visit(appointment_id, hospital_id=None):
+    return get_appointment_by_id(appointment_id, hospital_id=hospital_id)
+
+
+def update_op_symptoms(appointment_id, data, hospital_id=None):
+    scoped_hospital_id = hospital_id or resolve_hospital_id()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE appointments
+            SET chief_complaint = ?, symptoms = ?, symptom_duration = ?, symptom_severity = ?, ai_recommendation = ?
+            WHERE id = ? AND hospital_id = ? AND status NOT IN ('completed', 'cancelled')
+            """,
+            (
+                data.get("chief_complaint"), data.get("symptoms"),
+                data.get("symptom_duration"), data.get("symptom_severity"),
+                data.get("ai_recommendation"), appointment_id, scoped_hospital_id
+            ),
+        )
+        if cursor.rowcount:
+            cursor.execute(
+                """
+                UPDATE encounters
+                SET chief_complaint = ?, symptoms = ?, symptom_duration = ?, symptom_severity = ?
+                WHERE appointment_id = ? AND hospital_id = ?
+                """,
+                (
+                    data.get("chief_complaint"), data.get("symptoms"),
+                    data.get("symptom_duration"), data.get("symptom_severity"),
+                    appointment_id, scoped_hospital_id
+                ),
+            )
+            record_op_timeline_event(
+                appointment_id, "Symptoms Updated",
+                f"Symptoms updated: {data.get('chief_complaint') or ''} {data.get('symptoms') or ''}",
+                hospital_id=scoped_hospital_id
+            )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def transition_op_status(appointment_id, status, hospital_id=None, actor=None):
+    allowed = {
+        "scheduled": {"checked_in", "in_consultation", "cancelled"},
+        "checked_in": {"in_consultation", "completed", "cancelled"},
+        "in_consultation": {"completed", "post_consultation", "cancelled"},
+        "post_consultation": {"completed"},
+        "completed": set(),
+        "cancelled": set(),
+    }
+    scoped_hospital_id = hospital_id or resolve_hospital_id()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT status, doctor_name FROM appointments WHERE id = ? AND hospital_id = ? FOR UPDATE", (appointment_id, scoped_hospital_id))
+        row = cursor.fetchone()
+        if not row:
+            return "not_found"
+        if status not in allowed.get(row["status"], set()):
+            return "invalid_transition"
+        timestamp_column = _APPOINTMENT_STATUS_TIMESTAMP_COLUMNS.get(status)
+        if timestamp_column:
+            cursor.execute(f"UPDATE appointments SET status = ?, {timestamp_column} = COALESCE({timestamp_column}, CURRENT_TIMESTAMP) WHERE id = ? AND hospital_id = ?", (status, appointment_id, scoped_hospital_id))
+        else:
+            cursor.execute("UPDATE appointments SET status = ? WHERE id = ? AND hospital_id = ?", (status, appointment_id, scoped_hospital_id))
+        cursor.execute("UPDATE encounters SET status = ? WHERE appointment_id = ? AND hospital_id = ?", (status, appointment_id, scoped_hospital_id))
+
+        record_op_timeline_event(
+            appointment_id, f"Status: {status.replace('_', ' ').title()}",
+            f"OP Visit transitioned from {row['status']} to {status}",
+            actor=actor, hospital_id=scoped_hospital_id
+        )
+        conn.commit()
+        return "ok"
+
+
+def save_op_consultation(appointment_id, data, hospital_id=None):
+    scoped_hospital_id = hospital_id or resolve_hospital_id()
+    doctor_username = data.get("doctor_username") or "doctor"
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM appointments WHERE id = ? AND hospital_id = ? FOR UPDATE", (appointment_id, scoped_hospital_id))
+        appointment = cursor.fetchone()
+        if not appointment:
+            return "not_found"
+        if appointment["status"] not in ("checked_in", "in_consultation", "scheduled"):
+            return "invalid_status"
+
+        # Save Clinical Notes
+        cursor.execute(
+            """
+            INSERT INTO clinical_notes (encounter_id, patient_id, chief_complaint, notes, follow_up)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                appointment["encounter_id"], appointment["patient_id"],
+                data.get("chief_complaint") or appointment.get("chief_complaint") or "",
+                data.get("advice") or data.get("notes") or "",
+                data.get("follow_up")
+            ),
+        )
+
+        # Save Diagnosis Record
+        diagnosis = (data.get("diagnosis") or "").strip()
+        if diagnosis:
+            cursor.execute(
+                "INSERT INTO diagnosis_records (encounter_id, patient_id, diagnosis_name) VALUES (?, ?, ?)",
+                (appointment["encounter_id"], appointment["patient_id"], diagnosis),
+            )
+
+        # Save Prescriptions
+        medicines = data.get("medicines")
+        if medicines:
+            cursor.execute(
+                """
+                INSERT INTO pharmacy_prescriptions (hospital_id, patient_id, doctor_username, doc_id, medicines_json)
+                VALUES (?, ?, ?, ?, ?) RETURNING id
+                """,
+                (scoped_hospital_id, appointment["patient_id"], doctor_username, None, json.dumps(medicines)),
+            )
+
+        # Save Lab / Diagnostic orders if any
+        tests = data.get("tests") or []
+        if isinstance(tests, list):
+            for t in tests:
+                test_name = t if isinstance(t, str) else t.get("name") or t.get("test_name")
+                if test_name:
+                    cursor.execute(
+                        """
+                        INSERT INTO diagnostics (hospital_id, patient_id, doctor_name, test_name, amount, order_status, status, created_by)
+                        VALUES (?, ?, ?, ?, 0, 'ordered', 'due', ?)
+                        """,
+                        (scoped_hospital_id, appointment["patient_id"], appointment.get("doctor_name") or doctor_username, test_name, doctor_username),
+                    )
+
+        further_action = (data.get("further_action") or "none").lower()
+        further_action_notes = data.get("further_action_notes") or ""
+
+        # Update appointment & encounter
+        cursor.execute(
+            """
+            UPDATE appointments
+            SET status = 'completed',
+                op_status = 'consultation_completed',
+                further_action = ?,
+                further_action_notes = ?,
+                consultation_completed_at = COALESCE(consultation_completed_at, CURRENT_TIMESTAMP)
+            WHERE id = ? AND hospital_id = ?
+            """,
+            (further_action, further_action_notes, appointment_id, scoped_hospital_id),
+        )
+        cursor.execute(
+            "UPDATE encounters SET status = 'completed', further_action = ? WHERE id = ? AND hospital_id = ?",
+            (further_action, appointment["encounter_id"], scoped_hospital_id),
+        )
+
+        record_op_timeline_event(
+            appointment_id, "Consultation Completed",
+            f"Doctor consultation completed. Diagnosis: {diagnosis or 'None specified'}. Further action: {further_action}",
+            actor=doctor_username, hospital_id=scoped_hospital_id
+        )
+
+        conn.commit()
+        return "ok"
+
+
+def add_op_vitals(appointment_id, data, hospital_id=None, actor=None):
+    scoped_hospital_id = hospital_id or resolve_hospital_id()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT patient_id, encounter_id FROM appointments WHERE id = ? AND hospital_id = ?", (appointment_id, scoped_hospital_id))
+        appointment = cursor.fetchone()
+        if not appointment:
+            return None
+
+        bp = data.get("bp") or data.get("blood_pressure")
+        pulse = data.get("pulse") or data.get("heart_rate")
+        temp = data.get("temperature")
+        spo2 = data.get("spo2")
+        resp_rate = data.get("respiratory_rate")
+        weight = data.get("weight")
+        glucose = data.get("blood_glucose")
+        notes = data.get("notes")
+        recorded_by = actor or data.get("recorded_by") or "nurse"
+
+        cursor.execute(
+            """
+            INSERT INTO patient_vitals (
+                encounter_id, patient_id, bp, pulse, temperature,
+                spo2, respiratory_rate, weight, blood_glucose, notes, recorded_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+            """,
+            (
+                appointment["encounter_id"], appointment["patient_id"],
+                bp, pulse, temp, spo2, resp_rate, weight, glucose, notes, recorded_by
+            ),
+        )
+        vital_id = cursor.fetchone()[0]
+
+        summary_parts = []
+        if bp: summary_parts.append(f"BP: {bp}")
+        if pulse: summary_parts.append(f"HR: {pulse}")
+        if temp: summary_parts.append(f"Temp: {temp}")
+        if spo2: summary_parts.append(f"SpO2: {spo2}%")
+        if weight: summary_parts.append(f"Weight: {weight}kg")
+
+        record_op_timeline_event(
+            appointment_id, "Vitals Recorded",
+            f"Vitals recorded: {', '.join(summary_parts) if summary_parts else 'Recorded'}",
+            actor=recorded_by, hospital_id=scoped_hospital_id
+        )
+
+        conn.commit()
+        return vital_id
+
+
+def assign_op_doctor(appointment_id, doctor_name, hospital_id=None, actor=None):
+    scoped_hospital_id = hospital_id or resolve_hospital_id()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM appointments WHERE id = ? AND hospital_id = ? FOR UPDATE", (appointment_id, scoped_hospital_id))
+        appointment = cursor.fetchone()
+        if not appointment:
+            return "not_found"
+
+        cursor.execute("SELECT doctor_name, department, status, gender FROM doctors WHERE LOWER(doctor_name) = LOWER(?)", (doctor_name.strip(),))
+        doctor = cursor.fetchone()
+        if not doctor:
+            cursor.execute("SELECT full_name as doctor_name, department, status FROM users WHERE hospital_id = ? AND job_role = 'Doctor' AND LOWER(full_name) = LOWER(?)", (scoped_hospital_id, doctor_name.strip()))
+            doctor = cursor.fetchone()
+
+        if not doctor:
+            return "unavailable"
+
+        cursor.execute(
+            """
+            UPDATE appointments
+            SET doctor_name = ?, department = COALESCE(?, department), status = 'checked_in', op_status = 'doctor_assigned'
+            WHERE id = ? AND hospital_id = ?
+            """,
+            (doctor["doctor_name"], doctor.get("department"), appointment_id, scoped_hospital_id),
+        )
+
+        record_op_timeline_event(
+            appointment_id, "Doctor Assigned",
+            f"Patient assigned to {doctor['doctor_name']} ({doctor.get('department') or 'General'})",
+            actor=actor, hospital_id=scoped_hospital_id
+        )
+
+        conn.commit()
+        return "ok"
+
+
+def set_op_further_action(appointment_id, action, notes=None, hospital_id=None, actor=None):
+    scoped_hospital_id = hospital_id or resolve_hospital_id()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM appointments WHERE id = ? AND hospital_id = ? FOR UPDATE", (appointment_id, scoped_hospital_id))
+        appointment = cursor.fetchone()
+        if not appointment:
+            return "not_found"
+
+        clean_action = (action or "none").lower()
+        cursor.execute(
+            "UPDATE appointments SET further_action = ?, further_action_notes = ? WHERE id = ? AND hospital_id = ?",
+            (clean_action, notes or "", appointment_id, scoped_hospital_id),
+        )
+        if appointment.get("encounter_id"):
+            cursor.execute(
+                "UPDATE encounters SET further_action = ? WHERE id = ? AND hospital_id = ?",
+                (clean_action, appointment["encounter_id"], scoped_hospital_id),
+            )
+
+        record_op_timeline_event(
+            appointment_id, "Further Action Routed",
+            f"Next Action: {clean_action.upper()}{' - ' + notes if notes else ''}",
+            actor=actor, hospital_id=scoped_hospital_id
+        )
+
+        conn.commit()
+        return "ok"
+
+
+def get_op_timeline(appointment_id, hospital_id=None):
+    scoped_hospital_id = hospital_id or resolve_hospital_id()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM op_timeline WHERE appointment_id = ? AND hospital_id = ? ORDER BY created_at ASC, id ASC",
+            (appointment_id, scoped_hospital_id),
+        )
+        return cursor.fetchall()
+
+
+def get_op_patient_history(patient_id, hospital_id=None):
+    """Retrieve full history of OP visits, prescriptions, diagnoses, and vitals for a patient UMR."""
+    scoped_hospital_id = hospital_id or resolve_hospital_id()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT a.*, e.op_number as encounter_op_number, e.chief_complaint as encounter_complaint, e.symptoms as encounter_symptoms
+            FROM appointments a
+            LEFT JOIN encounters e ON a.encounter_id = e.id
+            WHERE a.patient_id = ? AND a.hospital_id = ? AND a.visit_type = 'OP'
+            ORDER BY a.appointment_date DESC, a.token_no DESC
+            """,
+            (patient_id, scoped_hospital_id),
+        )
+        visits = cursor.fetchall()
+        history = []
+        for v in visits:
+            enc_id = v.get("encounter_id")
+            diagnoses = []
+            notes = []
+            prescriptions = []
+            vitals = []
+
+            if enc_id:
+                cursor.execute("SELECT diagnosis_name, created_at FROM diagnosis_records WHERE encounter_id = ? ORDER BY id ASC", (enc_id,))
+                diagnoses = [r["diagnosis_name"] for r in cursor.fetchall()]
+
+                cursor.execute("SELECT notes, follow_up, created_at FROM clinical_notes WHERE encounter_id = ? ORDER BY id ASC", (enc_id,))
+                notes = [dict(r) for r in cursor.fetchall()]
+
+                cursor.execute("SELECT * FROM patient_vitals WHERE encounter_id = ? ORDER BY created_at ASC", (enc_id,))
+                vitals = [dict(r) for r in cursor.fetchall()]
+
+            cursor.execute("SELECT id, doctor_username, medicines_json, created_at FROM pharmacy_prescriptions WHERE patient_id = ? ORDER BY id DESC LIMIT 5", (patient_id,))
+            for pr in cursor.fetchall():
+                try:
+                    meds = json.loads(pr["medicines_json"]) if pr.get("medicines_json") else []
+                except Exception:
+                    meds = []
+                prescriptions.append({"id": pr["id"], "doctor_username": pr["doctor_username"], "medicines": meds, "created_at": pr["created_at"]})
+
+            history.append({
+                "appointment_id": v["id"],
+                "token_no": v["token_no"],
+                "appointment_date": str(v["appointment_date"]),
+                "doctor_name": v["doctor_name"],
+                "department": v["department"],
+                "status": v["status"],
+                "chief_complaint": v.get("chief_complaint") or v.get("encounter_complaint") or "",
+                "symptoms": v.get("symptoms") or v.get("encounter_symptoms") or "",
+                "symptom_duration": v.get("symptom_duration") or "",
+                "symptom_severity": v.get("symptom_severity") or "",
+                "further_action": v.get("further_action") or "none",
+                "diagnoses": diagnoses,
+                "clinical_notes": notes,
+                "prescriptions": prescriptions,
+                "vitals": vitals,
+            })
+        return history
+
+
+def get_op_summary(target_date=None, hospital_id=None):
+    day = target_date or current_ist_datetime().strftime("%Y-%m-%d")
+    scoped_hospital_id = hospital_id or resolve_hospital_id()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT COUNT(*) AS value FROM appointments WHERE hospital_id = ? AND visit_type = 'OP' AND DATE(appointment_date) = DATE(?)",
+            (scoped_hospital_id, day),
+        )
+        total_appointments = cursor.fetchone()["value"]
+
+        cursor.execute(
+            "SELECT COUNT(*) AS value FROM appointments WHERE hospital_id = ? AND visit_type = 'OP' AND appointment_kind = 'new' AND DATE(appointment_date) = DATE(?)",
+            (scoped_hospital_id, day),
+        )
+        new_patients = cursor.fetchone()["value"]
+
+        cursor.execute(
+            "SELECT COUNT(*) AS value FROM appointments WHERE hospital_id = ? AND visit_type = 'OP' AND appointment_kind IN ('revisit', 'follow_up') AND DATE(appointment_date) = DATE(?)",
+            (scoped_hospital_id, day),
+        )
+        follow_ups = cursor.fetchone()["value"]
+
+        cursor.execute(
+            "SELECT COUNT(*) AS value FROM appointments WHERE hospital_id = ? AND visit_type = 'OP' AND status = 'scheduled' AND DATE(appointment_date) = DATE(?)",
+            (scoped_hospital_id, day),
+        )
+        awaiting_doctor = cursor.fetchone()["value"]
+
+        cursor.execute(
+            "SELECT COUNT(*) AS value FROM appointments WHERE hospital_id = ? AND visit_type = 'OP' AND status = 'checked_in' AND DATE(appointment_date) = DATE(?)",
+            (scoped_hospital_id, day),
+        )
+        active_queue = cursor.fetchone()["value"]
+
+        cursor.execute(
+            "SELECT COUNT(*) AS value FROM appointments WHERE hospital_id = ? AND visit_type = 'OP' AND status = 'in_consultation' AND DATE(appointment_date) = DATE(?)",
+            (scoped_hospital_id, day),
+        )
+        in_consultation = cursor.fetchone()["value"]
+
+        cursor.execute(
+            "SELECT COUNT(*) AS value FROM appointments WHERE hospital_id = ? AND visit_type = 'OP' AND status = 'completed' AND DATE(appointment_date) = DATE(?)",
+            (scoped_hospital_id, day),
+        )
+        completed_visits = cursor.fetchone()["value"]
+
+        cursor.execute(
+            "SELECT COUNT(*) AS value FROM appointments WHERE hospital_id = ? AND visit_type = 'OP' AND no_show_marked = 1 AND DATE(appointment_date) = DATE(?)",
+            (scoped_hospital_id, day),
+        )
+        no_shows = cursor.fetchone()["value"]
+
+        cursor.execute(
+            "SELECT COUNT(*) AS value FROM appointments WHERE hospital_id = ? AND visit_type = 'OP' AND reminder_sent_at IS NOT NULL AND DATE(appointment_date) = DATE(?)",
+            (scoped_hospital_id, day),
+        )
+        reminders_sent = cursor.fetchone()["value"]
+
+        cursor.execute("SELECT COUNT(*) AS value FROM doctors WHERE status = 'available'")
+        available_doctors = cursor.fetchone()["value"]
+
+        cursor.execute("SELECT COUNT(*) AS value FROM doctors WHERE status = 'busy'")
+        busy_doctors = cursor.fetchone()["value"]
+
+        cursor.execute("SELECT COUNT(*) AS value FROM doctors WHERE status IN ('leave', 'inactive')")
+        leave_doctors = cursor.fetchone()["value"]
+
+        cursor.execute(
+            "SELECT COUNT(*) AS value FROM invoices WHERE hospital_id = ? AND module = 'OP' AND payment_status = 'due' AND DATE(created_at) = DATE(?)",
+            (scoped_hospital_id, day),
+        )
+        pending_billing = cursor.fetchone()["value"]
+
+        cursor.execute(
+            "SELECT COUNT(*) AS value FROM diagnostics WHERE hospital_id = ? AND status = 'ordered' AND DATE(created_at) = DATE(?)",
+            (scoped_hospital_id, day),
+        )
+        pending_investigations = cursor.fetchone()["value"]
+
+    return {
+        "date": day,
+        "total_appointments": total_appointments,
+        "new_patients": new_patients,
+        "follow_ups": follow_ups,
+        "awaiting_doctor": awaiting_doctor,
+        "active_queue": active_queue,
+        "in_consultation": in_consultation,
+        "completed": completed_visits,
+        "no_shows": no_shows,
+        "reminders_sent": reminders_sent,
+        "available_doctors": available_doctors,
+        "busy_doctors": busy_doctors,
+        "leave_doctors": leave_doctors,
+        "pending_billing": pending_billing,
+        "pending_investigations": pending_investigations,
+    }
 
 
 def get_appointment_by_id(appointment_id, hospital_id=None):
@@ -4867,6 +5814,86 @@ def ensure_pharmacy_hospital_columns(conn):
     conn.commit()
 
 
+def ensure_op_tables(conn):
+    """Ensure complete Outpatient (OP) workflow schema tables, columns, indexes,
+    and seed default specialty/gender-balanced doctors."""
+    cursor = conn.cursor()
+    id_column = "SERIAL PRIMARY KEY"
+
+    # Doctors schema
+    _ensure_column(cursor, "doctors", "gender", "TEXT DEFAULT 'Male'")
+    try:
+        cursor.execute("ALTER TABLE doctors DROP CONSTRAINT IF EXISTS doctors_status_check")
+    except Exception:
+        pass
+
+    # Appointments schema
+    _ensure_column(cursor, "appointments", "symptom_duration", "TEXT")
+    _ensure_column(cursor, "appointments", "symptom_severity", "TEXT DEFAULT 'moderate'")
+    _ensure_column(cursor, "appointments", "gender_preference", "TEXT")
+    _ensure_column(cursor, "appointments", "further_action", "TEXT")
+    _ensure_column(cursor, "appointments", "further_action_notes", "TEXT")
+    _ensure_column(cursor, "appointments", "op_status", "TEXT DEFAULT 'registered'")
+    _ensure_column(cursor, "appointments", "consultation_fee", "REAL DEFAULT 0")
+    _ensure_column(cursor, "appointments", "payment_mode", "TEXT DEFAULT 'cash'")
+
+    # Encounters schema
+    _ensure_column(cursor, "encounters", "symptom_duration", "TEXT")
+    _ensure_column(cursor, "encounters", "symptom_severity", "TEXT DEFAULT 'moderate'")
+    _ensure_column(cursor, "encounters", "further_action", "TEXT")
+
+    # Patient vitals schema
+    _ensure_column(cursor, "patient_vitals", "spo2", "TEXT")
+    _ensure_column(cursor, "patient_vitals", "respiratory_rate", "TEXT")
+    _ensure_column(cursor, "patient_vitals", "weight", "TEXT")
+    _ensure_column(cursor, "patient_vitals", "blood_glucose", "TEXT")
+    _ensure_column(cursor, "patient_vitals", "notes", "TEXT")
+    _ensure_column(cursor, "patient_vitals", "recorded_by", "TEXT")
+
+    # OP Timeline table
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS op_timeline (
+            id {id_column},
+            hospital_id INTEGER NOT NULL,
+            appointment_id INTEGER,
+            encounter_id INTEGER,
+            patient_id TEXT NOT NULL,
+            event_name TEXT NOT NULL,
+            event_description TEXT,
+            actor TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_op_timeline_appt ON op_timeline(appointment_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_op_timeline_patient ON op_timeline(patient_id)")
+
+    # Seed default gender-balanced doctors if table is empty
+    cursor.execute("SELECT COUNT(*) FROM doctors")
+    count_row = cursor.fetchone()
+    doc_count = count_row[0] if count_row else 0
+    if doc_count == 0:
+        default_docs = [
+            ("Dr. Emily Chen", "Cardiology", "Female", 500.0, 250.0, "available"),
+            ("Dr. Robert Davis", "Cardiology", "Male", 500.0, 250.0, "available"),
+            ("Dr. Sarah Patel", "General Medicine", "Female", 400.0, 200.0, "available"),
+            ("Dr. Michael Johnson", "General Medicine", "Male", 400.0, 200.0, "available"),
+            ("Dr. Priya Sharma", "Pediatrics", "Female", 450.0, 200.0, "available"),
+            ("Dr. David Wilson", "Orthopedics", "Male", 600.0, 300.0, "available"),
+            ("Dr. Lisa Martinez", "Neurology", "Female", 650.0, 300.0, "available"),
+            ("Dr. James Taylor", "Dermatology", "Male", 400.0, 200.0, "available"),
+        ]
+        for name, dept, gen, fee, rfee, stat in default_docs:
+            cursor.execute(
+                "INSERT INTO doctors (doctor_name, department, gender, consultation_fee, review_fee, status) VALUES (?, ?, ?, ?, ?, ?)",
+                (name, dept, gen, fee, rfee, stat),
+            )
+    else:
+        cursor.execute("UPDATE doctors SET gender = 'Male' WHERE gender IS NULL")
+        cursor.execute("UPDATE doctors SET gender = 'Female' WHERE doctor_name ILIKE '%Sarah%' OR doctor_name ILIKE '%Emily%' OR doctor_name ILIKE '%Priya%' OR doctor_name ILIKE '%Lisa%' OR doctor_name ILIKE '%Anita%'")
+
+    conn.commit()
+
+
 def list_beds(hospital_id):
     """All beds for a hospital, each with its current occupant (if any) via a
     LEFT JOIN to the active bed_allocations row -- one query for the whole
@@ -5739,8 +6766,8 @@ def create_invoice(data, hospital_id=None):
             INSERT INTO invoices (
                 invoice_no, patient_id, module, doctor_name, clinic_name, referral_source,
                 subtotal, tax, discount, total_amount, paid_amount, due_amount, payment_status, created_by,
-                advance_amount, refunded_amount, hospital_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                advance_amount, refunded_amount, hospital_id, appointment_id, encounter_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         insert_sql += " RETURNING id"
         cursor.execute(
@@ -5763,6 +6790,8 @@ def create_invoice(data, hospital_id=None):
                 advance_amount,
                 refunded_amount,
                 scoped_hospital_id,
+                data.get("appointment_id"),
+                data.get("encounter_id"),
             ),
         )
         invoice_id = cursor.fetchone()[0]
