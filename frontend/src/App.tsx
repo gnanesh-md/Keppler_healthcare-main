@@ -29,6 +29,7 @@ const DailyMonthlyReportsPage = lazy(
 );
 const PharmacyPage = lazy(() => import("./pages/PharmacyPage"));
 const BedManagementPage = lazy(() => import("./pages/BedManagementPage"));
+const ErPage = lazy(() => import("./pages/ErPage"));
 const HrmsPage = lazy(() => import("./pages/HrmsPage"));
 const PatientsPage = lazy(() => import("./pages/PatientsPage"));
 const ReadmitPage = lazy(() => import("./pages/ReadmitPage"));
@@ -89,7 +90,8 @@ type SidebarIconName =
   | "prescription"
   | "emr"
   | "feedback"
-  | "schedule";
+  | "schedule"
+  | "emergency";
 
 const NAV_ICON_MAP: Record<string, SidebarIconName> = {
   dashboard: "dashboard",
@@ -108,6 +110,7 @@ const NAV_ICON_MAP: Record<string, SidebarIconName> = {
   patients: "patients",
   readmit: "readmit",
   beds: "bed",
+  er: "emergency",
   billing: "billing",
   "billing-aging": "billing",
   "billing-reconciliation": "billing",
@@ -240,6 +243,12 @@ function SidebarIcon({ name }: { name: SidebarIconName }) {
         <rect x="5" y="9" width="5" height="4" rx="1.2" {...stroke} />
       </>
     ),
+    emergency: (
+      <>
+        <circle cx="12" cy="12" r="9" {...stroke} />
+        <path d="M12 7.5v9M7.5 12h9" {...stroke} />
+      </>
+    ),
     prescription: (
       <>
         <rect x="5" y="3" width="14" height="18" rx="2" {...stroke} />
@@ -369,6 +378,28 @@ function App() {
   const [appointmentPrefill, setAppointmentPrefill] = useState<{
     doctorName?: string;
     department?: string;
+  } | null>(null);
+  // Set when ER's "New" patient mode sends staff to Patient Registration --
+  // lets AddPatientPage send them back to ER (with the new patient
+  // pre-selected) instead of always defaulting to appointment booking, which
+  // is the wrong next step and an extra detour when the patient is actually
+  // an ER arrival, not an OP booking.
+  const [patientRegistrationReturnTo, setPatientRegistrationReturnTo] = useState<
+    string | null
+  >(null);
+  const [erPrefillPatient, setErPrefillPatient] = useState<{
+    patient_id: string;
+    name: string;
+    last_name?: string;
+  } | null>(null);
+  // Which unknown ER visit to merge the newly-registered patient into --
+  // set alongside patientRegistrationReturnTo when returnTo is "er-merge"
+  // (see MergeUnknownPatient's "Register as New Patient" button).
+  const [patientRegistrationMergeVisitId, setPatientRegistrationMergeVisitId] =
+    useState<number | null>(null);
+  const [erMergeTarget, setErMergeTarget] = useState<{
+    visitId: number;
+    patientId: string;
   } | null>(null);
   useEffect(() => {
     if (!notice) return;
@@ -1234,6 +1265,23 @@ function App() {
     } else if (nextPage === "appointment-in") {
       setAppointmentPrefill(null);
     }
+    if (nextPage === "add") {
+      // Only carries across this one navigation -- a later, unrelated visit
+      // to "add" (e.g. from the Dashboard's own "Register Patient" button)
+      // must not inherit a stale ER return intent from an earlier detour.
+      setPatientRegistrationReturnTo(extraData?.returnTo || null);
+      setPatientRegistrationMergeVisitId(extraData?.mergeVisitId ?? null);
+    }
+    if (nextPage === "er" && extraData?.newlyRegisteredPatient) {
+      setErPrefillPatient(extraData.newlyRegisteredPatient);
+    } else if (nextPage === "er") {
+      setErPrefillPatient(null);
+    }
+    if (nextPage === "er" && extraData?.mergeIntoVisit) {
+      setErMergeTarget(extraData.mergeIntoVisit);
+    } else if (nextPage === "er") {
+      setErMergeTarget(null);
+    }
     syncUrlForPage(nextPage);
     setPage(nextPage);
     setIsMobileMenuOpen(false);
@@ -1644,6 +1692,8 @@ function App() {
                 onCreate={handleCreatePatient}
                 setNotice={setNotice}
                 onNavigate={navigateToPage}
+                returnTo={patientRegistrationReturnTo}
+                mergeVisitId={patientRegistrationMergeVisitId}
               />
             )}
             {page === "ocr" && hasPermission("patients.documents.write") && (
@@ -1736,6 +1786,7 @@ function App() {
                 ocrLanguage={ocrLanguage}
                 languages={languages}
                 refreshToken={patientDetailRefreshToken}
+                onNavigate={setPage}
               />
             )}
 
@@ -1782,6 +1833,15 @@ function App() {
 
             {page === "beds" && hasPermission("beds.read") && (
               <BedManagementPage setNotice={setNotice} />
+            )}
+
+            {page === "er" && hasPermission("er.read") && (
+              <ErPage
+                setNotice={setNotice}
+                onNavigate={navigateToPage}
+                prefillPatient={erPrefillPatient}
+                mergeTarget={erMergeTarget}
+              />
             )}
 
             {page === "pharmacy" && hasPermission("pharmacy.read") && (

@@ -201,6 +201,7 @@ def appointments_create():
                     g.current_user.get("username") if hasattr(g, "current_user") else ""
                 ),
             },
+            hospital_id=current_hospital_id(),
         )
 
     log_audit_event(
@@ -358,6 +359,7 @@ def appointments_razorpay_verify():
             "converted_from_mode": payload.get("converted_from_mode"),
             "converted_to_mode": payload.get("converted_to_mode"),
         },
+        hospital_id=current_hospital_id(),
     )
     log_audit_event(
         "create",

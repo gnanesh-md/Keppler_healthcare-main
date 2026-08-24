@@ -16,6 +16,7 @@ from utils.database import (
     save_symptom_ai_chat_message,
     list_symptom_ai_chat_history,
     delete_symptom_ai_chat_history,
+    match_doctor_to_department,
 )
 
 symptom_ai_bp = Blueprint("symptom_ai_rag", __name__)
@@ -477,6 +478,7 @@ def symptom_ai_triage():
                     f"{department} for staff review. {reason}"
                 ),
                 "doctor": "",
+                "suggested_treatment": None,
                 "fallback": True,
             }
         )
@@ -494,11 +496,21 @@ Analyze the symptoms and provide a JSON response with:
 2. "urgency": "Low", "Medium", "High", or "Critical".
 3. "reasoning": A brief explanation of your recommendation (1-2 sentences).
 4. "doctor": Pick one name from the Available doctors list whose department (shown in parentheses) matches the "department" you chose above -- prefer a doctor explicitly named in the symptoms if one is mentioned, otherwise pick any doctor from that department. Only return an empty string if no doctor in the Available doctors list belongs to the chosen department.
+5. "suggested_treatment": a same-instant, first-line ER intervention this presentation demands before anything else -- if the presentation involves any of: cardiac/respiratory arrest, unresponsiveness, no pulse, not breathing, choking, severe bleeding, seizure, anaphylaxis, or vitals implying critical instability, you MUST return a concrete intervention here, never null. Only use null for genuinely routine/minor presentations (e.g. mild cold, small cut, routine checkup) where no immediate intervention is clinically indicated. Object shape: {{"intervention_type": one of "oxygen"/"iv_access"/"fluids"/"cpr"/"defibrillation"/"airway_management"/"other", "description": a short clinical note on why}}.
 
 Your response MUST be valid JSON only. Do not include markdown formatting or backticks.
 """
     try:
-        response_text = llm_provider.generate(prompt)
+        # This response is a short structured JSON object (5 short fields) --
+        # the provider's 2048-token default is sized for long-form generation
+        # (OCR extraction, RAG chat) and left unbounded here, a slow/loaded
+        # local model could keep generating well past what's needed before
+        # naturally stopping, taking well over a minute for what should be a
+        # few-second call. 400 tokens comfortably covers this response shape
+        # with room to spare, and json_mode asks the server to constrain
+        # output to valid JSON directly instead of relying solely on the
+        # markdown-fence-stripping fallback below.
+        response_text = llm_provider.generate(prompt, json_mode=True, max_tokens=400)
 
         # Guard: if the AI returned None (API key invalid / no internet / model error)
         if not response_text:
@@ -557,21 +569,110 @@ Your response MUST be valid JSON only. Do not include markdown formatting or bac
                     )
                 )
 
+        # Enforce the same hallucination guard on "doctor" that already exists
+        # for "department" above: the model sometimes returns a doctor name
+        # verbatim instead of leaving it blank, and nothing was previously
+        # checking that name was real before it got written into a patient's
+        # record downstream (ER assign-doctor trusts a non-empty doctor_name
+        # as-is). Strip any "(Department)" suffix from both sides so this
+        # works whichever format the caller's available_doctors list uses.
+        def _bare_name(entry: str) -> str:
+            m = re.match(r"^(.*)\(([^()]*)\)\s*$", entry.strip())
+            return (m.group(1).strip() if m else entry.strip())
+
+        def _normalize(name: str) -> str:
+            # Tolerant of "Dr. Naresh" vs "dr.naresh"-style spacing/
+            # punctuation differences between what the model says and how a
+            # name is stored -- only letters/digits count for comparison.
+            return re.sub(r"[^a-z0-9]", "", name.lower())
+
+        raw_doctor = (result.get("doctor") or "").strip()
+        if raw_doctor and available_doctors:
+            # Keyed by the full "Name (Department)" entry, not just the bare
+            # name -- a name existing in the roster at all isn't enough proof
+            # it's a valid pick; the model can name a REAL doctor from the
+            # WRONG specialty (e.g. picking a cardiologist for a urology case
+            # just because a name starting with the same letter is nearby in
+            # the prompt), which the name-only check below would've let
+            # through unchecked.
+            bare_available = {_normalize(_bare_name(d)): d for d in available_doctors}
+            candidate_entry = bare_available.get(_normalize(_bare_name(raw_doctor)))
+            if candidate_entry:
+                dept_match = re.match(r"^(.*)\(([^()]*)\)\s*$", candidate_entry.strip())
+                candidate_dept = dept_match.group(2).strip().lower() if dept_match else ""
+                target_dept = (result.get("department") or "").strip().lower()
+                if candidate_dept and target_dept and candidate_dept != target_dept:
+                    # Wrong specialty -- fall through to empty so the
+                    # deterministic match_doctor_to_department backstop below
+                    # picks someone actually in the right department instead.
+                    result["doctor"] = ""
+                else:
+                    result["doctor"] = _bare_name(candidate_entry)
+            else:
+                result["doctor"] = ""
+        elif raw_doctor and not available_doctors:
+            # No roster to validate against -- don't fabricate confidence
+            # either way; keep the model's answer as the caller has nothing
+            # to cross-check it with.
+            result["doctor"] = raw_doctor
+
         # The local model doesn't reliably pick a doctor even when one is available for
         # the chosen department, so backstop it deterministically here (mirrors the
-        # department hallucination guard above).
+        # department hallucination guard above). Shared with ER doctor assignment --
+        # see match_doctor_to_department in utils/database.py.
         if not (result.get("doctor") or "").strip() and available_doctors:
-            final_dept_lower = result.get("department", "").strip().lower()
-            for doc_entry in available_doctors:
-                m = re.match(r"^(.*)\(([^()]*)\)\s*$", doc_entry.strip())
-                doc_name, doc_dept = (
-                    (m.group(1).strip(), m.group(2).strip().lower())
-                    if m
-                    else (doc_entry.strip(), "")
-                )
-                if doc_dept == final_dept_lower:
-                    result["doctor"] = doc_name
-                    break
+            result["doctor"] = match_doctor_to_department(
+                available_doctors, result.get("department", "")
+            )
+
+        # Validate suggested_treatment the same way department/doctor are
+        # validated above -- the intervention_type gets written straight into
+        # a <select> on the ER Treatment form, so an unrecognized value would
+        # either silently fail to select anything or (worse) get logged as a
+        # patient's actual treatment record.
+        VALID_INTERVENTION_TYPES = {
+            "oxygen", "iv_access", "fluids", "cpr",
+            "defibrillation", "airway_management", "other",
+        }
+        # Free-text phrasings seen in testing instead of the exact enum value
+        # asked for (e.g. "IV fluids", "resuscitation") -- mapped to the
+        # closest real option rather than dropped, since a rough match staff
+        # can correct is strictly better than silently losing a real
+        # "give this patient something now" signal.
+        INTERVENTION_TYPE_ALIASES = {
+            "iv": "iv_access", "iv fluids": "fluids", "intravenous fluids": "fluids",
+            "fluid": "fluids", "cardiopulmonary resuscitation": "cpr",
+            "resuscitation": "cpr", "shock": "defibrillation",
+            "airway": "airway_management", "intubation": "airway_management",
+            "oxygen therapy": "oxygen", "o2": "oxygen",
+        }
+
+        def _normalize_intervention_type(raw: str) -> str:
+            key = raw.strip().lower()
+            if key in VALID_INTERVENTION_TYPES:
+                return key
+            return INTERVENTION_TYPE_ALIASES.get(key, "other")
+
+        suggested_treatment = result.get("suggested_treatment")
+        normalized_treatment = None
+        if isinstance(suggested_treatment, dict):
+            raw_type = str(suggested_treatment.get("intervention_type") or "").strip()
+            if raw_type:
+                normalized_treatment = {
+                    "intervention_type": _normalize_intervention_type(raw_type),
+                    "description": str(suggested_treatment.get("description") or "").strip()[:300],
+                }
+        elif isinstance(suggested_treatment, str) and suggested_treatment.strip():
+            # The model sometimes returns the bare type as a plain string
+            # instead of the {"intervention_type", "description"} object
+            # shape asked for -- still a real, usable suggestion, just
+            # shaped differently than requested.
+            mapped_type = _normalize_intervention_type(suggested_treatment)
+            normalized_treatment = {
+                "intervention_type": mapped_type,
+                "description": suggested_treatment.strip()[:300] if mapped_type == "other" else "",
+            }
+        result["suggested_treatment"] = normalized_treatment
 
         return jsonify(result)
     except json.JSONDecodeError:
